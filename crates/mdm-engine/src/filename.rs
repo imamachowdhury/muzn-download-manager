@@ -34,8 +34,10 @@ pub fn filename_from(content_disposition: Option<&str>, url: &Url) -> String {
 }
 
 fn from_content_disposition(cd: &str) -> Option<String> {
-    let params: Vec<(String, String)> = cd
-        .split(';')
+    // Split parameters with quote awareness: quoted strings may contain ';'
+    let param_strings = split_parameters(cd);
+    let params: Vec<(String, String)> = param_strings
+        .iter()
         .skip(1)
         .filter_map(|p| {
             let (k, v) = p.split_once('=')?;
@@ -57,6 +59,36 @@ fn from_content_disposition(cd: &str) -> Option<String> {
         }
     }
     None
+}
+
+// Split Content-Disposition header into parameters, respecting quoted strings.
+// Quoted values may contain ';' characters which are NOT treated as separators.
+fn split_parameters(header: &str) -> Vec<String> {
+    let mut params = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+
+    for ch in header.chars() {
+        match ch {
+            '"' => {
+                in_quotes = !in_quotes;
+                current.push(ch);
+            }
+            ';' if !in_quotes => {
+                params.push(current.clone());
+                current.clear();
+            }
+            _ => {
+                current.push(ch);
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        params.push(current);
+    }
+
+    params
 }
 
 /// Make `name` safe: no path separators or control characters, no leading or
@@ -135,6 +167,13 @@ mod tests {
             filename_from(Some("inline; filename=a.iso"), &u("https://x/y")),
             "a.iso"
         );
+    }
+
+    #[test]
+    fn quoted_filename_may_contain_semicolon() {
+        // Review finding 2026-09-18: a naive split on ';' returned "a".
+        let cd = r#"attachment; filename="a;b.txt""#;
+        assert_eq!(filename_from(Some(cd), &u("https://x/y")), "a;b.txt");
     }
 
     #[test]
