@@ -383,3 +383,30 @@ async fn a_reserved_part_file_is_neither_reused_nor_deleted() {
         b"a paused download's bytes"
     );
 }
+
+#[tokio::test]
+async fn a_reconfigured_engine_keeps_the_live_part_claims() {
+    // Task 9 review: a settings change built a new engine with an empty
+    // registry, so a same-name start on it shared a live download's part file.
+    let s = TestServer::start(3 * 1024 * 1024).await;
+    s.cfg.chunk_delay_ms.store(2, Ordering::SeqCst);
+    let d = tempfile::tempdir().unwrap();
+    let e = engine(2);
+    let a = e.start(spec(&s.file_url(), d.path())).await.unwrap();
+    let e2 = e
+        .reconfigured(EngineConfig {
+            max_connections: 2,
+            ..Default::default()
+        })
+        .unwrap();
+    let b = e2.start(spec(&s.file_url(), d.path())).await.unwrap();
+    assert_eq!(a.filename(), "file");
+    assert_eq!(b.filename(), "file (1)");
+    let (oa, ob) = tokio::join!(a.wait(), b.wait());
+    let (Outcome::Completed(pa), Outcome::Completed(pb)) = (oa, ob) else {
+        panic!()
+    };
+    assert_ne!(pa, pb);
+    assert_eq!(sha256_file(&pa), sha256_bytes(&s.data));
+    assert_eq!(sha256_file(&pb), sha256_bytes(&s.data));
+}

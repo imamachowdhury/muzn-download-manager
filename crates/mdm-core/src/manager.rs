@@ -124,9 +124,12 @@ impl Manager {
 
     /// Validate, save and apply settings. Running downloads keep their engine;
     /// new ones use the new settings. More parallel slots start queued rows at once.
+    /// The new engine shares the old one's live part claims. Call inside a
+    /// tokio runtime (it may start downloads).
     pub fn set_settings(&self, s: Settings) -> Result<Settings> {
         let s = s.validated()?;
-        let engine = Engine::new(s.engine_config()?)?;
+        let current = self.inner.engine.lock().unwrap().clone();
+        let engine = current.reconfigured(s.engine_config()?)?;
         self.inner.store.save_settings(&s)?;
         *self.inner.engine.lock().unwrap() = engine;
         *self.inner.settings.lock().unwrap() = s.clone();
@@ -134,7 +137,8 @@ impl Manager {
         Ok(s)
     }
 
-    /// Add a download (QUEUED, or PAUSED with `start_paused`).
+    /// Add a download (QUEUED, or PAUSED with `start_paused`). Call inside a
+    /// tokio runtime (it may start downloads).
     pub fn add(&self, mut new: NewDownload) -> Result<DownloadRow> {
         let url = Url::parse(new.url.trim())
             .map_err(|e| CoreError::InvalidUrl(format!("{}: {e}", new.url)))?;
