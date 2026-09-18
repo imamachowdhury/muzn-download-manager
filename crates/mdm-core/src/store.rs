@@ -3,12 +3,14 @@
 //! from async code, which is fine at this size (a few rows written a second).
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
+use mdm_engine::SegmentState;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::error::{CoreError, Result};
 use crate::model::*;
+use crate::settings::Settings;
 
 /// Newest schema this build knows.
 pub const SCHEMA_VERSION: i64 = 1;
@@ -93,6 +95,13 @@ impl Store {
         Ok(Store {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// The connection, locked for the caller's short-lived use. Never hold this
+    /// guard across a call to another `Store` method (the mutex is not
+    /// re-entrant).
+    pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap()
     }
 
     /// `PRAGMA user_version`.
@@ -225,6 +234,82 @@ impl Store {
             .lock()
             .unwrap()
             .execute("DELETE FROM downloads WHERE id = ?1", [id.as_str()])?;
+        Ok(())
+    }
+
+    /// Replace a download's segments.
+    pub fn save_segments(&self, id: &DownloadId, segs: &[SegmentState]) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM segments WHERE download_id = ?1", [id.as_str()])?;
+        {
+            let mut ins = tx.prepare(
+                "INSERT INTO segments (download_id, idx, start_byte, end_byte, downloaded) VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for s in segs {
+                ins.execute(params![
+                    id.as_str(),
+                    s.idx,
+                    s.start as i64,
+                    s.end as i64,
+                    s.downloaded as i64
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// A download's segments, by idx.
+    pub fn load_segments(&self, id: &DownloadId) -> Result<Vec<SegmentState>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT idx, start_byte, end_byte, downloaded FROM segments WHERE download_id = ?1 ORDER BY idx",
+        )?;
+        let rows = stmt.query_map([id.as_str()], |r| {
+            Ok(SegmentState {
+                idx: r.get(0)?,
+                start: r.get::<_, i64>(1)? as u64,
+                end: r.get::<_, i64>(2)? as u64,
+                downloaded: r.get::<_, i64>(3)? as u64,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Forget a download's segments (a fresh start follows).
+    pub fn clear_segments(&self, id: &DownloadId) -> Result<()> {
+        self.conn()
+            .execute("DELETE FROM segments WHERE download_id = ?1", [id.as_str()])?;
+        Ok(())
+    }
+
+    /// Stored settings, or defaults with `default_dir` as the download folder.
+    pub fn load_settings(&self, default_dir: &Path) -> Result<Settings> {
+        let raw: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'settings'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let mut s = match raw {
+            Some(json) => serde_json::from_str(&json)?,
+            None => Settings::default(),
+        };
+        if s.download_dir.as_os_str().is_empty() {
+            s.download_dir = default_dir.to_owned();
+        }
+        Ok(s)
+    }
+
+    /// Save settings.
+    pub fn save_settings(&self, s: &Settings) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO settings (key, value) VALUES ('settings', ?1) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            [serde_json::to_string(s)?],
+        )?;
         Ok(())
     }
 }

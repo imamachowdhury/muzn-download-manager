@@ -7,8 +7,10 @@
 
 pub mod error;
 pub mod model;
+pub mod settings;
 pub mod store;
 
 pub use error::{CoreError, Result};
 pub use model::*;
+pub use settings::{ProxySetting, Settings};
 pub use store::Store;
