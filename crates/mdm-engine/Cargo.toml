@@ -19,9 +19,8 @@ percent-encoding.workspace = true
 bytes.workspace = true
 
 [dev-dependencies]
-axum.workspace = true
+mdm-test-server = { path = "../mdm-test-server" }
 proptest.workspace = true
-sha2.workspace = true
 tempfile.workspace = true
 tokio-stream.workspace = true
 tokio = { workspace = true, features = ["full"] }

@@ -1,12 +1,10 @@
-mod support;
-
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
 use mdm_engine::segment::{fetch_segment, SegmentJob, SegmentRuntime};
 use mdm_engine::{EngineError, PartFile, RequestExtras};
-use support::*;
+use mdm_test_server::*;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 

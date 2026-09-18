@@ -1,10 +1,8 @@
-mod support;
-
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use mdm_engine::{DownloadSpec, Engine, EngineConfig, Outcome, RequestExtras, Status};
-use support::*;
+use mdm_test_server::*;
 use url::Url;
 
 fn engine(conns: u8) -> Engine {

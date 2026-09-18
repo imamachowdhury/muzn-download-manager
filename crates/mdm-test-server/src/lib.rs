@@ -1,6 +1,5 @@
 //! In-process HTTP server for engine tests. Every switch is an atomic so a
 //! test flips behaviour mid-download without restarting anything.
-#![allow(dead_code)]
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};

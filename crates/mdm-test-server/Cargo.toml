@@ -1,0 +1,19 @@
+[package]
+name = "mdm-test-server"
+description = "In-process HTTP server for Muzn Download Manager tests (never published)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+axum.workspace = true
+tokio = { workspace = true, features = ["full"] }
+futures-util.workspace = true
+bytes.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+reqwest.workspace = true

@@ -1,12 +1,10 @@
-mod support;
-
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use mdm_engine::{
     DownloadSpec, Engine, EngineConfig, Outcome, PartFile, RequestExtras, Resume, SegmentState,
 };
-use support::*;
+use mdm_test_server::*;
 use url::Url;
 
 const MIB: u64 = 1024 * 1024;
