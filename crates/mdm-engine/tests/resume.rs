@@ -28,6 +28,7 @@ fn spec(s: &TestServer, dir: &std::path::Path, resume: Option<Resume>) -> Downlo
         filename: None,
         extras: RequestExtras::default(),
         resume_from: resume,
+        reserved: Vec::new(),
     }
 }
 

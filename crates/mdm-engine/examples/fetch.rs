@@ -35,6 +35,7 @@ async fn main() {
             filename: None,
             extras: RequestExtras::default(),
             resume_from: None,
+            reserved: Vec::new(),
         })
         .await
     {

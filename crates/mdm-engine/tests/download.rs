@@ -22,6 +22,7 @@ fn spec(url: &str, dir: &std::path::Path) -> DownloadSpec {
         filename: None,
         extras: RequestExtras::default(),
         resume_from: None,
+        reserved: Vec::new(),
     }
 }
 
@@ -358,4 +359,27 @@ async fn two_live_downloads_of_the_same_name_get_separate_part_files() {
     assert_ne!(pa, pb);
     assert_eq!(sha256_file(&pa), sha256_bytes(&s.data));
     assert_eq!(sha256_file(&pb), sha256_bytes(&s.data));
+}
+
+#[tokio::test]
+async fn a_reserved_part_file_is_neither_reused_nor_deleted() {
+    // Task 5 review ruling: a paused / queued download's part file is not in
+    // the live registry, so a fresh start of the same name deleted it.
+    let s = TestServer::start(1024 * 1024).await;
+    let d = tempfile::tempdir().unwrap();
+    let reserved = d.path().join("file.mdm.part");
+    std::fs::write(&reserved, b"a paused download's bytes").unwrap();
+    let mut sp = spec(&s.file_url(), d.path());
+    sp.reserved = vec![reserved.clone()];
+    let h = engine(2).start(sp).await.unwrap();
+    assert_eq!(h.filename(), "file (1)");
+    let Outcome::Completed(path) = h.wait().await else {
+        panic!()
+    };
+    assert_eq!(path.file_name().unwrap(), "file (1)");
+    assert_eq!(sha256_file(&path), sha256_bytes(&s.data));
+    assert_eq!(
+        std::fs::read(&reserved).unwrap(),
+        b"a paused download's bytes"
+    );
 }

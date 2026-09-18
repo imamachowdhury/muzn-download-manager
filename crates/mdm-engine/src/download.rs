@@ -114,6 +114,10 @@ pub struct DownloadSpec {
     pub extras: RequestExtras,
     /// Continue a previous attempt.
     pub resume_from: Option<Resume>,
+    /// Part-file paths the caller owns for downloads that are not running
+    /// (paused, queued); treated exactly like live parts — a fresh start
+    /// picks another name and never deletes them.
+    pub reserved: Vec<PathBuf>,
 }
 
 const STOP_NONE: u8 = 0;
@@ -245,7 +249,9 @@ impl Engine {
     /// whose part file has the wrong length, is refused with
     /// [`EngineError::InvalidResume`].
     ///
-    /// A second live download of the same name gets `name (1).ext`; a resume
+    /// A second live download of the same name — or one whose part path is in
+    /// [`DownloadSpec::reserved`] — gets `name (1).ext`, and a reserved part
+    /// file is never deleted; a resume
     /// whose part file is already claimed by another live download is
     /// refused with [`EngineError::InvalidResume`] instead (its name is
     /// fixed, so there is nowhere else to put it).
@@ -265,6 +271,8 @@ impl Engine {
             let mut filename = base_filename.clone();
             let mut part_path = spec.dir.join(format!("{filename}{PART_SUFFIX}"));
             if spec.resume_from.is_some() {
+                // The caller does not reserve its own part file; a reserved
+                // path equal to it is not a conflict.
                 if live.contains(&part_path) {
                     return Err(EngineError::InvalidResume(
                         "the part file is in use by another download".into(),
@@ -272,7 +280,7 @@ impl Engine {
                 }
             } else {
                 let mut n = 1u32;
-                while live.contains(&part_path) {
+                while live.contains(&part_path) || spec.reserved.contains(&part_path) {
                     filename = numbered_filename(&base_filename, n);
                     part_path = spec.dir.join(format!("{filename}{PART_SUFFIX}"));
                     n += 1;

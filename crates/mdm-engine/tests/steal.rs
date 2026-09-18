@@ -49,6 +49,7 @@ async fn a_finished_worker_takes_half_of_the_largest_remaining_range() {
                 etag: Some("\"v1\"".into()),
                 last_modified: Some("Thu, 18 Sep 2026 10:00:00 GMT".into()),
             }),
+            reserved: Vec::new(),
         })
         .await
         .unwrap();
@@ -89,6 +90,7 @@ async fn nothing_is_stolen_when_less_than_two_mib_remain() {
             filename: None,
             extras: RequestExtras::default(),
             resume_from: None,
+            reserved: Vec::new(),
         })
         .await
         .unwrap();
