@@ -138,14 +138,27 @@ async fn file(State(s): State<AppState>, method: Method, headers: HeaderMap) -> 
     let slice = s.data[start as usize..(start + len) as usize].to_vec();
     let drop_after = cfg.drop_after.load(Ordering::SeqCst);
     let body = if drop_after > 0 && drop_after < len {
-        let good = slice[..drop_after as usize].to_vec();
-        Body::from_stream(stream::iter(vec![
-            Ok::<_, std::io::Error>(bytes::Bytes::from(good)),
-            Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionReset,
-                "test drop",
-            )),
-        ]))
+        let good = bytes::Bytes::from(slice[..drop_after as usize].to_vec());
+        Body::from_stream(stream::unfold(0u8, move |state| {
+            let good = good.clone();
+            async move {
+                match state {
+                    0 => Some((Ok::<_, std::io::Error>(good), 1)),
+                    1 => {
+                        // Let hyper flush the headers and the first chunk before the error.
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        Some((
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionReset,
+                                "test drop",
+                            )),
+                            2,
+                        ))
+                    }
+                    _ => None,
+                }
+            }
+        }))
     } else {
         Body::from(slice)
     };
