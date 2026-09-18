@@ -37,12 +37,16 @@ async fn start_and_pause(s: &TestServer, dir: &std::path::Path) -> Vec<SegmentSt
     s.cfg.hang_first.store(4, Ordering::SeqCst);
     let h = engine().start(spec(s, dir, None)).await.unwrap();
     let mut rx = h.subscribe();
-    loop {
-        rx.changed().await.unwrap();
-        if rx.borrow().downloaded >= 4000 {
-            break;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            rx.changed().await.unwrap();
+            if rx.borrow().downloaded >= 4000 {
+                break;
+            }
         }
-    }
+    })
+    .await
+    .expect("the four hung bodies should deliver 4 000 bytes within 20 s");
     h.pause();
     let Outcome::Paused(segs) = h.wait().await else {
         panic!("expected Paused")
