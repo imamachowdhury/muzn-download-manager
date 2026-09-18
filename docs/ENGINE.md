@@ -44,9 +44,10 @@ part file stays) — it never keeps running unowned.
 Before resuming the engine re-probes: a changed ETag / Last-Modified / size is
 `SOURCE_CHANGED`; a server that stopped honouring ranges is `RANGE_NOT_SUPPORTED`; a
 missing `.mdm.part` is `IO`; segments that do not run contiguously over `[0, size)`, or a
-part file whose length is not `size`, are `INVALID_RESUME`. All four mean "start over" to
-the caller. A fresh start discards any leftover `.mdm.part` of the same name; only a
-resume reuses it.
+part file whose length is not `size`, are `INVALID_RESUME`. All four mean this saved state
+cannot be resumed; the caller starts over. (`mdm-core` does that by itself once for the first
+three, but waits for the user on `SOURCE_CHANGED` — see CORE.md.) A fresh start discards any
+leftover `.mdm.part` of the same name; only a resume reuses it.
 
 ## Work stealing
 
