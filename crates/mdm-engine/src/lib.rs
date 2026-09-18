@@ -13,10 +13,12 @@ pub mod engine;
 pub mod error;
 pub mod filename;
 pub mod plan;
+pub mod probe;
 pub mod request;
 pub use engine::{Engine, EngineConfig, Proxy};
 pub use error::EngineError;
 pub use plan::{plan_segments, SegmentState, MAX_CONNECTIONS, MIN_SEGMENT_BYTES};
+pub use probe::Probe;
 pub use request::{Cookie, RequestExtras};
 
 #[cfg(test)]

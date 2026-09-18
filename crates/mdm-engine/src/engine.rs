@@ -43,7 +43,6 @@ impl Default for EngineConfig {
 #[derive(Clone)]
 pub struct Engine {
     /// The HTTP client used by all download operations.
-    #[expect(dead_code)]
     pub(crate) client: reqwest::Client,
     /// The engine configuration.
     pub(crate) cfg: EngineConfig,
