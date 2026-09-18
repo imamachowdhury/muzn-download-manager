@@ -11,7 +11,9 @@ probe → plan → allocate → fetch (N workers) → complete
 - **plan** (`plan.rs`): `min(max_connections (≤ 32), ceil(size / 1 MiB))` contiguous segments.
 - **allocate** (`file.rs`): `<name>.mdm.part`, pre-sized. Positioned writes; no merge step.
 - **fetch** (`segment.rs`): one worker per segment. `Range: bytes=<next>-<end>`, expects 206
-  with a matching `Content-Range`. Transient errors back off 1, 2, 4 … 60 s, ten attempts.
+  with a matching `Content-Range`. Transient errors back off 1, 2, 4 … 60 s. Only attempts that
+  write no bytes count against the budget: ten of those in a row fail the segment, but any attempt
+  that makes progress resets both the count and the backoff (owner, 2026-09-18).
   30 s (`stall_timeout`) without bytes, or without response headers, = reconnect; the
   probe's HEAD and GET wait at most as long. 4xx except 429 = fail at once; 429 and 5xx back off like
   network errors. A single stream (server without range support) restarts from byte 0 on
@@ -22,8 +24,10 @@ probe → plan → allocate → fetch (N workers) → complete
 Cookies and `Authorization` are dropped when a redirect leaves the original origin;
 `Range`, `Host` and `Content-Length` from the caller are never sent.
 
-A second live download of the same name gets `name (1).ext`; a resume of a part file
-that is in use is refused (`INVALID_RESUME`).
+A second live download of the same name gets `name (1).ext`; so does a fresh start whose chosen
+name is in `DownloadSpec::reserved` — the caller's part-file paths of its other, not-yet-running
+downloads, which a fresh start must neither take nor delete. A resume of a part file already
+claimed by another live download is refused (`INVALID_RESUME`) instead, since its name is fixed.
 
 ## Progress, pause, resume
 
