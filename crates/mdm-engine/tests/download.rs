@@ -74,7 +74,10 @@ async fn single_stream_when_ranges_off() {
     };
     assert_eq!(sha256_file(&path), sha256_bytes(&s.data));
     assert_eq!(rx.borrow().segments.len(), 1);
-    assert_eq!(s.cfg.requests.load(Ordering::SeqCst), 1);
+    // Task 6, item 1: a HEAD with a length but no Accept-Ranges no longer
+    // settles the question, so the probe also does its GET Range: bytes=0-0
+    // fallback before the real single-stream fetch — two GETs, not one.
+    assert_eq!(s.cfg.requests.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -99,6 +102,38 @@ async fn zero_byte_file_completes_immediately() {
     let s = TestServer::start(0).await;
     let d = tempfile::tempdir().unwrap();
     let h = engine(8)
+        .start(spec(&s.file_url(), d.path()))
+        .await
+        .unwrap();
+    let Outcome::Completed(path) = h.wait().await else {
+        panic!()
+    };
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn a_stream_of_unknown_length_completes() {
+    let s = TestServer::start(100_000).await;
+    s.cfg.chunked.store(true, Ordering::SeqCst);
+    let d = tempfile::tempdir().unwrap();
+    let h = engine(4)
+        .start(spec(&s.file_url(), d.path()))
+        .await
+        .unwrap();
+    assert_eq!(h.probe().size, None);
+    let Outcome::Completed(path) = h.wait().await else {
+        panic!()
+    };
+    assert_eq!(sha256_file(&path), sha256_bytes(&s.data));
+}
+
+#[tokio::test]
+async fn an_empty_stream_of_unknown_length_completes() {
+    // Final review 2026-09-18: it failed with "workers ended with bytes missing".
+    let s = TestServer::start(0).await;
+    s.cfg.chunked.store(true, Ordering::SeqCst);
+    let d = tempfile::tempdir().unwrap();
+    let h = engine(4)
         .start(spec(&s.file_url(), d.path()))
         .await
         .unwrap();

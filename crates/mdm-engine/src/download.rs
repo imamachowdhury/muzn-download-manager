@@ -438,15 +438,23 @@ fn validate_resume(r: &Resume, part_path: &Path) -> Result<(), EngineError> {
             if s.end < s.start {
                 return bad(format!("segment {} ends before it starts", s.idx));
             }
-            if s.downloaded > s.end - s.start + 1 {
+            // `end - start + 1` and `end + 1` can each overflow on corrupted
+            // input (e.g. `end: u64::MAX`); `checked_*` turns that into a
+            // refusal instead of a panic.
+            let len = match s.end.checked_sub(s.start).and_then(|x| x.checked_add(1)) {
+                Some(len) => len,
+                None => return bad(format!("segment {} has an invalid range", s.idx)),
+            };
+            if s.downloaded > len {
                 return bad(format!(
-                    "segment {} claims {} bytes of a {}-byte range",
-                    s.idx,
-                    s.downloaded,
-                    s.end - s.start + 1
+                    "segment {} claims {} bytes of a {len}-byte range",
+                    s.idx, s.downloaded,
                 ));
             }
-            expect = s.end + 1;
+            expect = match s.end.checked_add(1) {
+                Some(e) => e,
+                None => return bad(format!("segment {} end overflows", s.idx)),
+            };
         }
         if expect != r.size {
             return bad(format!(
@@ -577,6 +585,10 @@ impl Run {
         let mut meter = SpeedMeter::default();
         let mut failure: Option<EngineError> = None;
         let mut last_sync = Instant::now();
+        // Set when any worker returns `Ok(())`; only meaningful for the
+        // single-stream-of-unknown-length case below, where it is the only
+        // sign the download is actually complete.
+        let mut worker_ok = false;
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
@@ -596,6 +608,7 @@ impl Run {
                 res = set.join_next() => match res {
                     None => break,
                     Some(Ok(Ok(()))) => {
+                        worker_ok = true;
                         if failure.is_none() && !self.cancel.is_cancelled() {
                             if let Some(job) = self.steal() {
                                 set.spawn(fetch_segment(job));
@@ -623,7 +636,13 @@ impl Run {
         // is not heading for completion syncs once more, so a Paused / Failed
         // outcome is durable; this happens while `self` is still whole.
         let stop = self.stop.load(Ordering::SeqCst);
-        let all_done = self.snapshot().iter().all(|s| s.is_done());
+        // A single stream of unknown length has no `end` to reach: its
+        // worker returning Ok means the server ended the body normally.
+        let all_done = if !self.ranged && self.total.is_none() {
+            failure.is_none() && worker_ok
+        } else {
+            self.snapshot().iter().all(|s| s.is_done())
+        };
         if failure.is_some() || stop != STOP_NONE || !all_done {
             self.sync_to(self.snapshot()).await;
         }

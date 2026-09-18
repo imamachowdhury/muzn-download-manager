@@ -157,6 +157,20 @@ async fn range_ignored_by_server_is_range_not_supported() {
 }
 
 #[tokio::test]
+async fn a_206_without_content_range_is_range_not_supported_at_once() {
+    let s = TestServer::start(10_000).await;
+    s.cfg.omit_content_range.store(true, Ordering::SeqCst);
+    let d = tempfile::tempdir().unwrap();
+    let seg = Arc::new(SegmentRuntime::new(0, 100, Some(199), 0));
+    let (j, _) = job(&s, d.path(), seg, true);
+    assert_eq!(
+        fetch_segment(j).await.unwrap_err().code(),
+        "RANGE_NOT_SUPPORTED"
+    );
+    assert_eq!(s.cfg.requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn stall_reconnects() {
     let s = TestServer::start(100_000).await;
     s.cfg.hang_first.store(1, Ordering::SeqCst); // first body hangs after 1 000 bytes

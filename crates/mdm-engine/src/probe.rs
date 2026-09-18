@@ -47,12 +47,20 @@ impl Engine {
         // Both requests wait at most `stall_timeout` for the response headers:
         // a silent HEAD falls through to the GET, a silent GET is a network error.
         let wait = self.cfg.stall_timeout;
+        // A HEAD with a length settles things only when it also advertises
+        // ranges: a length with no `Accept-Ranges` does not prove the server
+        // will honour a `Range` request, so the GET fallback below still
+        // runs. Its `Content-Length` is kept in case that GET answers `200`
+        // without one of its own (a server that only states the length on HEAD).
+        let mut head_size: Option<u64> = None;
         let head = extras.apply(self.client.head(url.clone())).send();
         if let Ok(Ok(r)) = timeout(wait, head).await {
             if r.status().is_success() {
                 if let Some(size) = header_u64(&r, CONTENT_LENGTH) {
-                    let ranges = accepts_ranges(&r);
-                    return Ok(build(r, Some(size), ranges));
+                    if accepts_ranges(&r) {
+                        return Ok(build(r, Some(size), true));
+                    }
+                    head_size = Some(size);
                 }
             }
         }
@@ -72,7 +80,10 @@ impl Engine {
         let (size, ranges) = if status == StatusCode::PARTIAL_CONTENT {
             (content_range_total(&r), true)
         } else {
-            (header_u64(&r, CONTENT_LENGTH), accepts_ranges(&r))
+            (
+                header_u64(&r, CONTENT_LENGTH).or(head_size),
+                accepts_ranges(&r),
+            )
         };
         Ok(build(r, size, ranges)) // the body is dropped unread
     }

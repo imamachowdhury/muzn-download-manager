@@ -231,6 +231,24 @@ async fn dropping_the_handle_stops_the_download_and_leaves_a_resumable_part() {
 }
 
 #[tokio::test]
+async fn corrupted_resume_state_is_refused_not_a_panic() {
+    let s = TestServer::start(SIZE).await;
+    let d = tempfile::tempdir().unwrap();
+    let _ = start_and_pause(&s, d.path()).await;
+    let bad = vec![SegmentState {
+        idx: 0,
+        start: 0,
+        end: u64::MAX,
+        downloaded: 0,
+    }];
+    let e = engine()
+        .start(spec(&s, d.path(), Some(resume(&s, bad))))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), "INVALID_RESUME");
+}
+
+#[tokio::test]
 async fn resume_rejects_segments_that_do_not_cover_the_file() {
     // Final review 2026-09-18: a resume used to trust its segments and could
     // "complete" a file with a zero-filled hole.

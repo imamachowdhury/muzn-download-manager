@@ -34,6 +34,19 @@ pub struct ServerCfg {
     /// The `Cookie` header of the last GET of `/file`; `None` when it carried
     /// none (or there has not been one yet).
     pub last_cookie: Mutex<Option<String>>,
+    /// Whether a Range-honouring response also advertises `Accept-Ranges:
+    /// bytes` (true). `false` = the header is omitted, but `Range` is still
+    /// honoured — a server that supports ranges without saying so.
+    pub advertise_ranges: AtomicBool,
+    /// `false` (default) = every response states `Content-Length`, as usual.
+    /// `true` = neither HEAD nor GET ever states one, ranges are never
+    /// honoured (there is nothing to slice a length-less stream by), and the
+    /// GET body is sent via a stream rather than a fixed-length buffer.
+    pub chunked: AtomicBool,
+    /// `false` (default): a `206` response carries its usual `Content-Range`.
+    /// `true`: the status is still `206`, but the header is left off — a
+    /// server that lies about answering ranges.
+    pub omit_content_range: AtomicBool,
 }
 
 impl Default for ServerCfg {
@@ -50,6 +63,9 @@ impl Default for ServerCfg {
             chunk_delay_ms: AtomicU64::new(0),
             hang_headers: AtomicU32::new(0),
             last_cookie: Mutex::new(None),
+            advertise_ranges: AtomicBool::new(true),
+            chunked: AtomicBool::new(false),
+            omit_content_range: AtomicBool::new(false),
         }
     }
 }
@@ -139,7 +155,11 @@ async fn file(State(s): State<AppState>, method: Method, headers: HeaderMap) -> 
         }
     }
     let total = s.data.len() as u64;
-    let ranges = cfg.ranges.load(Ordering::SeqCst);
+    // `chunked` simulates a server that never states a length: there is
+    // nothing to slice a length-less stream by, so ranges are never
+    // honoured either way, whatever `cfg.ranges` says.
+    let chunked = cfg.chunked.load(Ordering::SeqCst);
+    let ranges = cfg.ranges.load(Ordering::SeqCst) && !chunked;
     let range = if ranges {
         headers
             .get(header::RANGE)
@@ -152,7 +172,9 @@ async fn file(State(s): State<AppState>, method: Method, headers: HeaderMap) -> 
         .header(header::ETAG, cfg.etag.lock().unwrap().clone())
         .header(header::LAST_MODIFIED, "Thu, 18 Sep 2026 10:00:00 GMT")
         .header(header::CONTENT_TYPE, "application/octet-stream");
-    if ranges {
+    // `advertise_ranges` only gates this header: a server that honours Range
+    // without ever mentioning `Accept-Ranges` still answers 206 below.
+    if ranges && cfg.advertise_ranges.load(Ordering::SeqCst) {
         rb = rb.header(header::ACCEPT_RANGES, "bytes");
     }
     if let Some(cd) = cfg.content_disposition.lock().unwrap().clone() {
@@ -163,15 +185,29 @@ async fn file(State(s): State<AppState>, method: Method, headers: HeaderMap) -> 
         None => (StatusCode::OK, 0, total.saturating_sub(1)),
     };
     let len = if total == 0 { 0 } else { end - start + 1 };
-    rb = rb.status(status).header(header::CONTENT_LENGTH, len);
-    if status == StatusCode::PARTIAL_CONTENT {
+    rb = rb.status(status);
+    if !chunked {
+        rb = rb.header(header::CONTENT_LENGTH, len);
+    }
+    if status == StatusCode::PARTIAL_CONTENT && !cfg.omit_content_range.load(Ordering::SeqCst) {
         rb = rb.header(
             header::CONTENT_RANGE,
             format!("bytes {start}-{end}/{total}"),
         );
     }
     if method == Method::HEAD {
-        return rb.body(Body::empty()).unwrap();
+        return if chunked {
+            // `Body::empty()` has an exact, known size (0), and hyper fills
+            // in `Content-Length: 0` for it when we leave the header off —
+            // exactly the length this switch exists to hide. An empty
+            // stream's size is unknown to hyper, so nothing gets added.
+            rb.body(Body::from_stream(stream::empty::<
+                Result<bytes::Bytes, std::io::Error>,
+            >()))
+            .unwrap()
+        } else {
+            rb.body(Body::empty()).unwrap()
+        };
     }
     let slice = s.data[start as usize..(start + len) as usize].to_vec();
     let drop_after = cfg.drop_after.load(Ordering::SeqCst);
@@ -228,6 +264,13 @@ async fn file(State(s): State<AppState>, method: Method, headers: HeaderMap) -> 
                 Some((Ok::<_, std::io::Error>(bytes::Bytes::from(c)), it))
             },
         ))
+    } else if chunked {
+        // No Content-Length was sent above; streaming the body (even as one
+        // chunk, possibly empty) makes hyper use chunked transfer-encoding
+        // instead of announcing a length.
+        Body::from_stream(stream::once(async move {
+            Ok::<_, std::io::Error>(bytes::Bytes::from(slice))
+        }))
     } else {
         Body::from(slice)
     };

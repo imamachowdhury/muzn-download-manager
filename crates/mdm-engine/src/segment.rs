@@ -214,9 +214,16 @@ async fn attempt_once(job: &SegmentJob, wrote: &mut u64) -> Result<(), EngineErr
                     .parse::<u64>()
                     .ok()
             });
-        if starts_at != Some(next) {
+        let starts_at = match starts_at {
+            // A 206 with no usable Content-Range cannot be trusted to answer
+            // ranges at all, however it phrased the status: fail once, not
+            // after ten retries of the same lie.
+            None => return Err(EngineError::RangeNotSupported),
+            Some(s) => s,
+        };
+        if starts_at != next {
             return Err(EngineError::Network(format!(
-                "Content-Range starts at {starts_at:?}, wanted {next}"
+                "Content-Range starts at {starts_at}, wanted {next}"
             )));
         }
     } else if !status.is_success() {
@@ -267,8 +274,14 @@ async fn attempt_once(job: &SegmentJob, wrote: &mut u64) -> Result<(), EngineErr
     }
     let end = seg.end.load(Ordering::SeqCst);
     if end == UNKNOWN_END {
-        seg.end
-            .store(pos.saturating_sub(1).max(seg.start), Ordering::SeqCst);
+        // A single stream that ended having written nothing this attempt
+        // (an empty file, or a retry that reconnected but got no bytes
+        // before the server closed again) leaves `end` unknown rather than
+        // claiming byte `start` exists: the snapshot of a truly empty
+        // stream must be `downloaded: 0`, not a phantom 1-byte file.
+        if pos > seg.start {
+            seg.end.store(pos - 1, Ordering::SeqCst);
+        }
         return Ok(());
     }
     if pos <= end {
