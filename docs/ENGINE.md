@@ -8,11 +8,13 @@ probe → plan → allocate → fetch (N workers) → complete
 
 - **probe** (`probe.rs`): HEAD, or GET `Range: bytes=0-0`. Size, range support, ETag,
   Last-Modified, MIME, file name. Redirects followed; `final_url` is what workers fetch.
-- **plan** (`plan.rs`): `min(max_connections, ceil(size / 1 MiB))` contiguous segments.
+- **plan** (`plan.rs`): `min(max_connections (≤ 32), ceil(size / 1 MiB))` contiguous segments.
 - **allocate** (`file.rs`): `<name>.mdm.part`, pre-sized. Positioned writes; no merge step.
 - **fetch** (`segment.rs`): one worker per segment. `Range: bytes=<next>-<end>`, expects 206
   with a matching `Content-Range`. Transient errors back off 1, 2, 4 … 60 s, ten attempts.
-  30 s without bytes = reconnect. 4xx = fail at once.
+  30 s without bytes = reconnect. 4xx except 429 = fail at once; 429 and 5xx back off like
+  network errors. A single stream (server without range support) restarts from byte 0 on
+  every retry — a plain GET always answers from the beginning.
 - **complete** (`download.rs`): fsync, rename, `name (1).ext` on a clash.
 
 ## Progress, pause, resume
@@ -23,7 +25,8 @@ probe → plan → allocate → fetch (N workers) → complete
 `resume_from: Resume { segments, size, etag, last_modified }`. A crash is the same path.
 Before resuming the engine re-probes: a changed ETag / Last-Modified / size is
 `SOURCE_CHANGED`; a server that stopped honouring ranges is `RANGE_NOT_SUPPORTED`; a
-missing `.mdm.part` is `IO`. All three mean "start over" to the caller.
+missing `.mdm.part` is `IO`. All three mean "start over" to the caller. A fresh start
+discards any leftover `.mdm.part` of the same name; only a resume reuses it.
 
 ## Work stealing
 

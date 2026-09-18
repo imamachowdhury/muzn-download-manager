@@ -56,7 +56,7 @@ async fn main() {
                     let len = s.end - s.start + 1;
                     match s.downloaded * 8 / len.max(1) {
                         8.. => '█',
-                        n => "▁▂▃▄▅▆▇".chars().nth(n as usize).unwrap_or('▁'),
+                        n => "▁▂▃▄▅▆▇".chars().nth((n as usize).min(6)).unwrap_or('▁'),
                     }
                 })
                 .collect();
