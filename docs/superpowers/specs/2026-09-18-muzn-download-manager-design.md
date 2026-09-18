@@ -170,6 +170,9 @@ sidecar json). On completion the `.part` is renamed to the final name; a clash b
 
 - Transient (connect error, timeout, reset, 5xx, 429): exponential backoff 1, 2, 4 … 60 s,
   max 10 attempts per segment, then the download is `FAILED` with the last error.
+  **Owner decision (2026-09-18, lands in Plan 2):** the 10-attempt budget resets whenever an
+  attempt wrote at least one byte, and the backoff restarts from 1 s — only ten attempts in a row
+  WITHOUT progress fail a download. (Plan 1 ships the stricter per-download count.)
 - Permanent (401, 403, 404, 410, TLS error): fail at once — the link expired or is wrong.
 - Stall: 30 s with no bytes on a segment → drop and reconnect that segment.
 - Work stealing: when a segment finishes and others still have more than 2 MiB left, the
