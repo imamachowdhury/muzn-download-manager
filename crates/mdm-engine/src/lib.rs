@@ -9,6 +9,7 @@
 /// Engine version, for User-Agent strings.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+pub mod filename;
 pub mod plan;
 pub use plan::{plan_segments, SegmentState, MAX_CONNECTIONS, MIN_SEGMENT_BYTES};
 
