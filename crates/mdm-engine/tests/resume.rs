@@ -282,3 +282,67 @@ async fn cancel_leaves_the_part_file_for_the_caller() {
     assert!(part.exists());
     std::fs::remove_file(part).unwrap();
 }
+
+#[tokio::test]
+async fn a_control_pauses_while_another_task_waits() {
+    let s = TestServer::start(SIZE).await;
+    let d = tempfile::tempdir().unwrap();
+    s.cfg.hang_first.store(4, Ordering::SeqCst);
+    let h = engine().start(spec(&s, d.path(), None)).await.unwrap();
+    let control = h.control();
+    let waiter = tokio::spawn(h.wait());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    control.pause();
+    let out = tokio::time::timeout(Duration::from_secs(10), waiter)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(out, Outcome::Paused(_)), "{out:?}");
+}
+
+#[tokio::test]
+async fn cancel_then_drop_still_reports_cancelled() {
+    // Final review 2026-09-18: dropping the handle after cancel() must not turn
+    // the cancel into a pause.
+    let s = TestServer::start(SIZE).await;
+    let d = tempfile::tempdir().unwrap();
+    s.cfg.hang_first.store(4, Ordering::SeqCst);
+    let h = engine().start(spec(&s, d.path(), None)).await.unwrap();
+    let mut rx = h.subscribe();
+    h.cancel();
+    drop(h);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while rx.changed().await.is_ok() {}
+    })
+    .await
+    .unwrap();
+    assert_eq!(rx.borrow().status, Status::Cancelled);
+}
+
+#[tokio::test]
+async fn a_pause_that_arrives_after_the_last_byte_still_completes() {
+    // Every segment of the resume is already complete; the pause lands before
+    // the run task is even polled (current-thread runtime), yet the file is
+    // whole, so the honest outcome is Completed, not a Paused complete file.
+    let s = TestServer::start(SIZE).await;
+    let d = tempfile::tempdir().unwrap();
+    let segs = start_and_pause(&s, d.path()).await;
+    std::fs::write(d.path().join("file.mdm.part"), s.data.as_slice()).unwrap();
+    let full: Vec<SegmentState> = segs
+        .iter()
+        .map(|x| SegmentState {
+            downloaded: x.end - x.start + 1,
+            ..x.clone()
+        })
+        .collect();
+    let h = engine()
+        .start(spec(&s, d.path(), Some(resume(&s, full))))
+        .await
+        .unwrap();
+    h.pause();
+    let out = h.wait().await;
+    let Outcome::Completed(path) = out else {
+        panic!("{out:?}")
+    };
+    assert_eq!(sha256_file(&path), sha256_bytes(&s.data));
+}

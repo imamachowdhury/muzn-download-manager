@@ -37,6 +37,10 @@ pub enum EngineError {
     /// Any other I/O failure.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// An invariant inside the engine broke (a worker panicked, a file handle
+    /// leaked). Not retryable; report it.
+    #[error("internal error: {0}")]
+    Internal(String),
 }
 
 #[cfg(windows)]
@@ -82,6 +86,7 @@ impl EngineError {
             Self::Cancelled => "CANCELLED",
             Self::InvalidResume(_) => "INVALID_RESUME",
             Self::Io(_) => "IO",
+            Self::Internal(_) => "INTERNAL",
         }
     }
 
@@ -149,6 +154,8 @@ mod tests {
             "INVALID_RESUME"
         );
         assert!(!EngineError::InvalidResume("x".into()).is_transient());
+        assert_eq!(EngineError::Internal("x".into()).code(), "INTERNAL");
+        assert!(!EngineError::Internal("x".into()).is_transient());
     }
 
     #[test]

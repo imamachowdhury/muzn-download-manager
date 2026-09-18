@@ -29,6 +29,8 @@ same name share one part file.
 `resume_from: Resume { segments, size, etag, last_modified }`. A crash is the same path.
 Dropping a `DownloadHandle` without `wait()` pauses its download (the task stops, the
 part file stays) — it never keeps running unowned.
+`handle.control()` gives a cloneable pause / cancel for use while another task awaits
+`wait()`. A pause that arrives after the last byte still completes the file.
 Before resuming the engine re-probes: a changed ETag / Last-Modified / size is
 `SOURCE_CHANGED`; a server that stopped honouring ranges is `RANGE_NOT_SUPPORTED`; a
 missing `.mdm.part` is `IO`; segments that do not run contiguously over `[0, size)`, or a
@@ -45,7 +47,8 @@ victim notices and stops. This is why the last 10 % does not crawl on one connec
 ## Errors
 
 `EngineError::code()` is stable: `INVALID_URL`, `RANGE_NOT_SUPPORTED`, `SOURCE_CHANGED`,
-`DISK_FULL`, `HTTP_STATUS`, `NETWORK`, `TLS`, `CANCELLED`, `INVALID_RESUME`, `IO`.
+`DISK_FULL`, `HTTP_STATUS`, `NETWORK`, `TLS`, `CANCELLED`, `INVALID_RESUME`, `IO`,
+`INTERNAL`.
 
 ## Tests
 

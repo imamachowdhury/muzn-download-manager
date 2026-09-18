@@ -122,9 +122,38 @@ struct StopOnDrop {
 impl Drop for StopOnDrop {
     fn drop(&mut self) {
         if self.armed {
-            self.stop.store(STOP_PAUSE, Ordering::SeqCst);
+            // Only claim PAUSE if nothing else already set a stop code: a
+            // `cancel()` just before the handle is dropped must still report
+            // Cancelled, not be overwritten into a Paused.
+            let _ = self.stop.compare_exchange(
+                STOP_NONE,
+                STOP_PAUSE,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
             self.cancel.cancel();
         }
+    }
+}
+
+/// Pause or cancel a running download from anywhere, while another task owns
+/// the [`DownloadHandle`] and awaits `wait()`.
+#[derive(Clone, Debug)]
+pub struct DownloadControl {
+    stop: Arc<AtomicU8>,
+    cancel: CancellationToken,
+}
+
+impl DownloadControl {
+    /// Same as [`DownloadHandle::pause`].
+    pub fn pause(&self) {
+        self.stop.store(STOP_PAUSE, Ordering::SeqCst);
+        self.cancel.cancel();
+    }
+    /// Same as [`DownloadHandle::cancel`].
+    pub fn cancel(&self) {
+        self.stop.store(STOP_CANCEL, Ordering::SeqCst);
+        self.cancel.cancel();
     }
 }
 
@@ -159,6 +188,14 @@ impl DownloadHandle {
     pub fn subscribe(&self) -> watch::Receiver<Progress> {
         self.rx.clone()
     }
+    /// A cloneable pause / cancel for use while another task owns this
+    /// handle and awaits [`Self::wait`].
+    pub fn control(&self) -> DownloadControl {
+        DownloadControl {
+            stop: self.stop.clone(),
+            cancel: self.cancel.clone(),
+        }
+    }
     /// Stop the workers; `wait()` returns `Outcome::Paused`.
     pub fn pause(&self) {
         self.stop.store(STOP_PAUSE, Ordering::SeqCst);
@@ -173,7 +210,7 @@ impl DownloadHandle {
     /// download, like dropping the handle.
     pub async fn wait(mut self) -> Outcome {
         let outcome = (&mut self.join).await.unwrap_or_else(|_| Outcome::Failed {
-            error: EngineError::Network("download task panicked".into()),
+            error: EngineError::Internal("download task panicked".into()),
             segments: Vec::new(),
         });
         self.guard.armed = false;
@@ -456,7 +493,7 @@ impl Run {
                     }
                     Some(Err(_)) => {
                         if failure.is_none() {
-                            failure = Some(EngineError::Network("worker panicked".into()));
+                            failure = Some(EngineError::Internal("worker panicked".into()));
                             self.cancel.cancel();
                         }
                     }
@@ -480,27 +517,28 @@ impl Run {
                 error,
                 segments: segments.clone(),
             }
-        } else {
-            match stop {
-                STOP_PAUSE => Outcome::Paused(segments.clone()),
-                STOP_CANCEL => Outcome::Cancelled,
-                _ if all_done => match Arc::try_unwrap(file) {
-                    Ok(file) => match file.finish() {
-                        Ok(path) => Outcome::Completed(path),
-                        Err(error) => Outcome::Failed {
-                            error,
-                            segments: segments.clone(),
-                        },
-                    },
-                    Err(_) => Outcome::Failed {
-                        error: EngineError::Network("part file still in use".into()),
+        } else if stop == STOP_CANCEL {
+            Outcome::Cancelled
+        } else if all_done {
+            match Arc::try_unwrap(file) {
+                Ok(file) => match file.finish() {
+                    Ok(path) => Outcome::Completed(path),
+                    Err(error) => Outcome::Failed {
+                        error,
                         segments: segments.clone(),
                     },
                 },
-                _ => Outcome::Failed {
-                    error: EngineError::Network("workers ended with bytes missing".into()),
+                Err(_) => Outcome::Failed {
+                    error: EngineError::Internal("part file still in use".into()),
                     segments: segments.clone(),
                 },
+            }
+        } else if stop == STOP_PAUSE {
+            Outcome::Paused(segments.clone())
+        } else {
+            Outcome::Failed {
+                error: EngineError::Internal("workers ended with bytes missing".into()),
+                segments: segments.clone(),
             }
         };
         let status = match &outcome {
