@@ -34,11 +34,33 @@ pub(crate) const INTENT_REMOVE: u8 = 3;
 /// download continues at the next launch.
 pub(crate) const INTENT_SHUTDOWN: u8 = 4;
 
+/// How strongly an intent wins over another that arrives later or earlier:
+/// REMOVE beats CANCEL beats SHUTDOWN beats PAUSE beats NONE. A signal only
+/// ever raises a slot's intent to a higher rank, never lowers it, so an
+/// earlier REMOVE cannot be undone by a later PAUSE.
+fn rank(intent: u8) -> u8 {
+    match intent {
+        INTENT_REMOVE => 4,
+        INTENT_CANCEL => 3,
+        INTENT_SHUTDOWN => 2,
+        INTENT_PAUSE => 1,
+        _ => 0,
+    }
+}
+
 /// The control surface of one running download.
 #[derive(Clone)]
 pub(crate) struct Slot {
     intent: Arc<AtomicU8>,
     delete_file: Arc<AtomicBool>,
+    /// Set by a `resume()` that arrived while this slot was still running: a
+    /// later intent (PAUSE/SHUTDOWN/CANCEL/REMOVE) cancels the pending resume
+    /// again, since it is asking for something else entirely.
+    resume_after: Arc<AtomicBool>,
+    /// The intent `settle` (or the Completed path) actually acted on, so the
+    /// driver's end can tell a "late" signal — one that outranks this — from
+    /// one it already handled.
+    consumed: Arc<AtomicU8>,
     token: CancellationToken,
     control: Arc<Mutex<Option<DownloadControl>>>,
 }
@@ -48,16 +70,31 @@ impl Slot {
         Self {
             intent: Arc::new(AtomicU8::new(INTENT_NONE)),
             delete_file: Arc::new(AtomicBool::new(false)),
+            resume_after: Arc::new(AtomicBool::new(false)),
+            consumed: Arc::new(AtomicU8::new(INTENT_NONE)),
             token: CancellationToken::new(),
             control: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Record the intent, wake a probe waiting on the token, and stop an
-    /// engine control if one is attached: PAUSE/SHUTDOWN pause it, everything
-    /// else (CANCEL, REMOVE) cancels it.
+    /// Raise the intent only if it outranks whatever is already there —
+    /// intents rank, they never overwrite a stronger one that arrived first.
+    /// When it does raise: clear a pending resume (this is asking for
+    /// something else), wake a probe waiting on the token, and stop an
+    /// engine control if one is attached, according to the intent that just
+    /// won: PAUSE/SHUTDOWN pause it, everything else (CANCEL, REMOVE)
+    /// cancels it. When it does not raise, nothing here is touched.
     fn signal(&self, intent: u8) {
-        self.intent.store(intent, Ordering::SeqCst);
+        let raised = self
+            .intent
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+                (rank(intent) > rank(cur)).then_some(intent)
+            })
+            .is_ok();
+        if !raised {
+            return;
+        }
+        self.resume_after.store(false, Ordering::SeqCst);
         self.token.cancel();
         if let Some(control) = self.control.lock().unwrap().as_ref() {
             if intent == INTENT_PAUSE || intent == INTENT_SHUTDOWN {
@@ -185,8 +222,14 @@ impl Manager {
     }
 
     /// Pause: a running download stops and saves its state; a queued one simply waits.
+    ///
+    /// Holds the `running` lock for the whole call — either to signal the
+    /// slot, or, if the row is not running, across the store write — so
+    /// `schedule` (which needs the same lock to start a row) can never start
+    /// this one mid-action.
     pub fn pause(&self, id: &DownloadId) -> Result<()> {
-        if let Some(slot) = self.inner.slot(id) {
+        let running = self.inner.running.lock().unwrap();
+        if let Some(slot) = running.get(id) {
             slot.signal(INTENT_PAUSE);
             return Ok(());
         }
@@ -198,28 +241,37 @@ impl Manager {
     }
 
     /// Resume a paused, failed or cancelled download (a cancelled one starts from zero).
+    /// If it is still running, remember the request instead: a later
+    /// PAUSE/SHUTDOWN/CANCEL/REMOVE clears it, otherwise the driver queues
+    /// the row again once it stops.
     pub fn resume(&self, id: &DownloadId) -> Result<()> {
-        if self.inner.slot(id).is_some() {
+        let running = self.inner.running.lock().unwrap();
+        if let Some(slot) = running.get(id) {
+            slot.resume_after.store(true, Ordering::SeqCst);
             return Ok(());
         }
         let row = self.inner.require(id)?;
         match row.status {
             DownloadStatus::Paused | DownloadStatus::Failed | DownloadStatus::Cancelled => {
                 self.inner.set_status(id, DownloadStatus::Queued, None)?;
-                Inner::schedule(&self.inner);
-                Ok(())
             }
-            DownloadStatus::Queued => Ok(()),
-            s => Err(CoreError::InvalidState(format!(
-                "cannot resume a {} download",
-                s.as_str()
-            ))),
+            DownloadStatus::Queued => return Ok(()),
+            s => {
+                return Err(CoreError::InvalidState(format!(
+                    "cannot resume a {} download",
+                    s.as_str()
+                )))
+            }
         }
+        drop(running);
+        Inner::schedule(&self.inner);
+        Ok(())
     }
 
     /// Cancel: stop and delete the partial data.
     pub fn cancel(&self, id: &DownloadId) -> Result<()> {
-        if let Some(slot) = self.inner.slot(id) {
+        let running = self.inner.running.lock().unwrap();
+        if let Some(slot) = running.get(id) {
             slot.signal(INTENT_CANCEL);
             return Ok(());
         }
@@ -238,7 +290,8 @@ impl Manager {
 
     /// Remove from the list; `delete_file` also deletes a finished file.
     pub fn remove(&self, id: &DownloadId, delete_file: bool) -> Result<()> {
-        if let Some(slot) = self.inner.slot(id) {
+        let running = self.inner.running.lock().unwrap();
+        if let Some(slot) = running.get(id) {
             slot.delete_file.store(delete_file, Ordering::SeqCst);
             slot.signal(INTENT_REMOVE);
             return Ok(());
@@ -249,39 +302,50 @@ impl Manager {
 
     /// Start over from byte 0 (after SOURCE_CHANGED, for example).
     pub fn restart(&self, id: &DownloadId) -> Result<()> {
-        let row = self.inner.require(id)?;
-        if self.inner.slot(id).is_some() {
+        let running = self.inner.running.lock().unwrap();
+        if running.contains_key(id) {
             return Err(CoreError::InvalidState(
                 "pause the download before restarting it".into(),
             ));
         }
+        let row = self.inner.require(id)?;
         if row.status == DownloadStatus::Completed {
             return Err(CoreError::InvalidState("the download is complete".into()));
         }
         self.inner.discard_partial(&row)?;
         self.inner.set_status(id, DownloadStatus::Queued, None)?;
+        drop(running);
         Inner::schedule(&self.inner);
         Ok(())
     }
 
-    /// Pause everything queued or running.
+    /// Pause everything queued or running. A row removed by someone else
+    /// mid-loop (NOT_FOUND) is skipped; any other error stops the sweep.
     pub fn pause_all(&self) -> Result<()> {
         for row in self.list()? {
             if matches!(
                 row.status,
                 DownloadStatus::Queued | DownloadStatus::Probing | DownloadStatus::Downloading
             ) {
-                self.pause(&row.id)?;
+                match self.pause(&row.id) {
+                    Ok(()) => {}
+                    Err(CoreError::NotFound(_)) => {}
+                    Err(e) => return Err(e),
+                }
             }
         }
         Ok(())
     }
 
-    /// Resume everything paused.
+    /// Resume everything paused. Same NOT_FOUND tolerance as `pause_all`.
     pub fn resume_all(&self) -> Result<()> {
         for row in self.list()? {
             if row.status == DownloadStatus::Paused {
-                self.resume(&row.id)?;
+                match self.resume(&row.id) {
+                    Ok(()) => {}
+                    Err(CoreError::NotFound(_)) => {}
+                    Err(e) => return Err(e),
+                }
             }
         }
         Ok(())
@@ -290,26 +354,27 @@ impl Manager {
     /// Before the app exits: stop scheduling, pause everything running, wait
     /// until each has saved its state. Those rows are QUEUED again, so they
     /// continue at the next launch.
+    ///
+    /// `closing` is set and every slot signalled while still holding
+    /// `running`, so a `schedule` racing this call either sees `closing`
+    /// first and does nothing, or has already started a row that this same
+    /// lock will then signal — never a row started after we stopped looking.
     pub async fn shutdown(&self) {
-        self.inner.closing.store(true, Ordering::SeqCst);
-        let slots: Vec<Slot> = self
-            .inner
-            .running
-            .lock()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect();
-        for s in slots {
-            s.signal(INTENT_SHUTDOWN);
-        }
-        let tasks = std::mem::take(&mut *self.inner.tasks.lock().unwrap());
+        let tasks = {
+            let running = self.inner.running.lock().unwrap();
+            self.inner.closing.store(true, Ordering::SeqCst);
+            for slot in running.values() {
+                slot.signal(INTENT_SHUTDOWN);
+            }
+            std::mem::take(&mut *self.inner.tasks.lock().unwrap())
+        };
         for t in tasks {
             let _ = t.await;
         }
     }
 
-    /// Tests only: stop every driver the way a crash would, saving nothing more.
+    /// Tests only: abort every driver the way a crash would. The engine's
+    /// forwarder may still save one last durable snapshot.
     #[doc(hidden)]
     pub fn simulate_crash(&self) {
         self.inner.closing.store(true, Ordering::SeqCst);
@@ -328,11 +393,6 @@ impl Inner {
         self.store
             .get(id)?
             .ok_or_else(|| CoreError::NotFound(id.to_string()))
-    }
-
-    /// The running slot for `id`, if it is currently driven.
-    pub(crate) fn slot(&self, id: &DownloadId) -> Option<Slot> {
-        self.running.lock().unwrap().get(id).cloned()
     }
 
     pub(crate) fn set_status(
@@ -405,10 +465,13 @@ impl Inner {
         Ok(())
     }
 
-    /// Finish a download that stopped because it was asked to.
+    /// Finish a download that stopped because it was asked to. Records the
+    /// intent it acted on into `slot.consumed`, so the driver's end can tell
+    /// a signal that arrived after this from one already handled here.
     fn settle(&self, id: &DownloadId, slot: &Slot) -> Result<()> {
         let row = self.require(id)?;
-        match slot.intent.load(Ordering::SeqCst) {
+        let intent = slot.intent.load(Ordering::SeqCst);
+        let result = match intent {
             INTENT_CANCEL => {
                 self.discard_partial(&row)?;
                 self.set_status(id, DownloadStatus::Cancelled, None)
@@ -416,18 +479,56 @@ impl Inner {
             INTENT_REMOVE => self.remove_now(&row, slot.delete_file.load(Ordering::SeqCst)),
             INTENT_SHUTDOWN => self.set_status(id, DownloadStatus::Queued, None),
             _ => self.set_status(id, DownloadStatus::Paused, None),
+        };
+        slot.consumed.store(intent, Ordering::SeqCst);
+        result
+    }
+
+    /// After the driver stops, however it stopped: under the `running` lock,
+    /// apply any signal that outranks what was already consumed (a "late"
+    /// signal — one that arrived after `settle` or the Completed path had
+    /// already decided the outcome), apply a pending `resume`, then drop the
+    /// slot. Holding the lock for all of this is what makes it safe: nothing
+    /// else can act on this row (or start a new one) while it runs.
+    fn finish(&self, id: &DownloadId, slot: &Slot) {
+        let mut running = self.running.lock().unwrap();
+        let final_intent = slot.intent.load(Ordering::SeqCst);
+        let consumed = slot.consumed.load(Ordering::SeqCst);
+        if rank(final_intent) > rank(consumed) {
+            if let Ok(Some(row)) = self.store.get(id) {
+                let _ = match final_intent {
+                    INTENT_REMOVE => self.remove_now(&row, slot.delete_file.load(Ordering::SeqCst)),
+                    INTENT_CANCEL if row.status != DownloadStatus::Completed => self
+                        .discard_partial(&row)
+                        .and_then(|()| self.set_status(id, DownloadStatus::Cancelled, None)),
+                    INTENT_SHUTDOWN if row.status == DownloadStatus::Paused => {
+                        self.set_status(id, DownloadStatus::Queued, None)
+                    }
+                    // CANCEL on an already-Completed row, PAUSE, or SHUTDOWN
+                    // on anything but Paused: nothing more to do.
+                    _ => Ok(()),
+                };
+            }
         }
+        if slot.resume_after.load(Ordering::SeqCst) {
+            if let Ok(Some(row)) = self.store.get(id) {
+                if matches!(
+                    row.status,
+                    DownloadStatus::Paused | DownloadStatus::Failed | DownloadStatus::Cancelled
+                ) {
+                    let _ = self.set_status(id, DownloadStatus::Queued, None);
+                }
+            }
+        }
+        running.remove(id);
     }
 
     /// Start queued downloads while there are free slots.
     pub(crate) fn schedule(this: &Arc<Inner>) {
-        if this.closing.load(Ordering::SeqCst) {
-            return;
-        }
         let max = this.settings.lock().unwrap().max_parallel as usize;
         loop {
             let mut running = this.running.lock().unwrap();
-            if running.len() >= max {
+            if this.closing.load(Ordering::SeqCst) || running.len() >= max {
                 return;
             }
             let exclude: Vec<DownloadId> = running.keys().cloned().collect();
@@ -441,7 +542,6 @@ impl Inner {
             let Some(id) = next else { return };
             let slot = Slot::new();
             running.insert(id.clone(), slot.clone());
-            drop(running);
             let task = tokio::spawn(drive(this.clone(), id, slot));
             let mut tasks = this.tasks.lock().unwrap();
             tasks.retain(|t| !t.is_finished());
@@ -497,16 +597,27 @@ async fn drive(inner: Arc<Inner>, id: DownloadId, slot: Slot) {
             Some((e.code(), &e.to_string())),
         );
     }
-    inner.running.lock().unwrap().remove(&id);
+    inner.finish(&id, &slot);
     Inner::schedule(&inner);
 }
 
 async fn drive_inner(inner: &Arc<Inner>, id: &DownloadId, slot: &Slot) -> Result<()> {
     let mut started_over = false;
+    let mut first_pass = true;
     loop {
         let Some(row) = inner.store.get(id)? else {
             return Ok(());
         };
+        // Belt and braces: `schedule` only ever starts a QUEUED row while
+        // holding the same lock a concurrent `pause` needs, so this should
+        // never actually see anything else here — but if it ever does, do
+        // not touch a row a pause (or worse) has already claimed.
+        if first_pass {
+            first_pass = false;
+            if row.status != DownloadStatus::Queued {
+                return Ok(());
+            }
+        }
         let segments = inner.store.load_segments(id)?;
         let resume = match (row.size, segments.is_empty()) {
             (Some(size), false) => Some(Resume {
@@ -585,6 +696,7 @@ async fn drive_inner(inner: &Arc<Inner>, id: &DownloadId, slot: &Slot) -> Result
                 if slot.intent.load(Ordering::SeqCst) == INTENT_REMOVE {
                     let row = inner.require(id)?;
                     inner.remove_now(&row, slot.delete_file.load(Ordering::SeqCst))?;
+                    slot.consumed.store(INTENT_REMOVE, Ordering::SeqCst);
                 }
                 return Ok(());
             }

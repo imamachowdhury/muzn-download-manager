@@ -412,3 +412,90 @@ async fn unknown_ids_are_not_found() {
         assert_eq!(e.unwrap_err().code(), "NOT_FOUND");
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remove_then_shutdown_still_removes() {
+    // Review finding 2026-09-19: a later signal overwrote an earlier one.
+    let s = TestServer::start(8 * 1024 * 1024).await;
+    let d = tempfile::tempdir().unwrap();
+    let m = manager(d.path());
+    let id = parked(&s, &m).await;
+    m.remove(&id, false).unwrap();
+    tokio::time::timeout(Duration::from_secs(20), m.shutdown())
+        .await
+        .unwrap();
+    assert!(m.get(&id).unwrap().is_none());
+    assert!(!d.path().join("file.mdm.part").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_then_pause_all_stays_cancelled() {
+    let s = TestServer::start(8 * 1024 * 1024).await;
+    let d = tempfile::tempdir().unwrap();
+    let m = manager(d.path());
+    let id = parked(&s, &m).await;
+    m.cancel(&id).unwrap();
+    m.pause_all().unwrap();
+    wait_for(&m, &id, DownloadStatus::Cancelled).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        m.get(&id).unwrap().unwrap().status,
+        DownloadStatus::Cancelled
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pausing_a_queued_download_keeps_it_from_starting() {
+    let s = TestServer::start(2 * 1024 * 1024).await;
+    s.cfg.chunk_delay_ms.store(5, Ordering::SeqCst);
+    let d = tempfile::tempdir().unwrap();
+    let m = manager(d.path());
+    m.set_settings(Settings {
+        max_parallel: 1,
+        ..m.settings()
+    })
+    .unwrap();
+    let first = add(&m, &s.file_url());
+    let second = add(&m, &s.file_url());
+    m.pause(&second).unwrap();
+    wait_for(&m, &first, DownloadStatus::Completed).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        m.get(&second).unwrap().unwrap().status,
+        DownloadStatus::Paused
+    );
+    m.resume_all().unwrap();
+    wait_for(&m, &second, DownloadStatus::Completed).await;
+}
+
+#[tokio::test]
+async fn a_failed_download_resumes_from_its_saved_segments() {
+    let s = TestServer::start(8 * 1024 * 1024).await;
+    let d = tempfile::tempdir().unwrap();
+    let db = d.path().join("db.sqlite");
+    let m = Manager::open(&db, d.path()).unwrap();
+    m.set_settings(Settings {
+        max_connections: 4,
+        ..m.settings()
+    })
+    .unwrap();
+    let id = parked(&s, &m).await;
+    m.pause(&id).unwrap();
+    wait_for(&m, &id, DownloadStatus::Paused).await;
+    // Turn the paused row into a FAILED one with saved segments, as a mid-download failure leaves it.
+    Store::open(&db)
+        .unwrap()
+        .set_status(
+            &id,
+            DownloadStatus::Failed,
+            Some(("NETWORK", "test")),
+            now_ms(),
+        )
+        .unwrap();
+    s.cfg.hang_first.store(0, Ordering::SeqCst);
+    let before = s.cfg.requests.load(Ordering::SeqCst);
+    m.resume(&id).unwrap();
+    wait_for(&m, &id, DownloadStatus::Completed).await;
+    assert_eq!(sha256_file(&d.path().join("file")), sha256_bytes(&s.data));
+    assert!(s.cfg.requests.load(Ordering::SeqCst) > before);
+}
