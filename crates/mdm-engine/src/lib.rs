@@ -9,9 +9,15 @@
 /// Engine version, for User-Agent strings.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+pub mod engine;
+pub mod error;
 pub mod filename;
 pub mod plan;
+pub mod request;
+pub use engine::{Engine, EngineConfig, Proxy};
+pub use error::EngineError;
 pub use plan::{plan_segments, SegmentState, MAX_CONNECTIONS, MIN_SEGMENT_BYTES};
+pub use request::{Cookie, RequestExtras};
 
 #[cfg(test)]
 mod tests {
