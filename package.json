@@ -1,0 +1,6 @@
+{
+  "name": "muzn-download-manager",
+  "private": true,
+  "packageManager": "pnpm@12.4.2",
+  "workspaces": ["extension"]
+}

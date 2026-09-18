@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/imamachowdhury/muzn-download-manager"
+authors = ["Imam Ahmed"]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "stream"] }
+futures-util = "0.3"
+url = "2"
+thiserror = "2"
+tracing = "0.1"
+percent-encoding = "2"
+bytes = "1"
+
+# dev
+axum = "0.7"
+proptest = "1"
+sha2 = "0.10"
+tempfile = "3"
+tokio-stream = "0.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
