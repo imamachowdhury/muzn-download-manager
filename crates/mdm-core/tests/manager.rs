@@ -239,3 +239,176 @@ async fn a_new_download_never_deletes_a_paused_ones_part_file() {
         DownloadStatus::Paused
     );
 }
+
+/// Wait for a Progress event of `id` with at least `min` bytes.
+async fn wait_bytes(
+    rx: &mut tokio::sync::broadcast::Receiver<ManagerEvent>,
+    id: &DownloadId,
+    min: u64,
+) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let Ok(ManagerEvent::Progress {
+                id: pid,
+                downloaded,
+                ..
+            }) = rx.recv().await
+            {
+                if &pid == id && downloaded >= min {
+                    return;
+                }
+            }
+        }
+    })
+    .await
+    .expect("progress arrived");
+}
+
+/// An 8 MiB download parked at 4 000 bytes (four connections, four hung bodies).
+async fn parked(s: &TestServer, m: &Manager) -> DownloadId {
+    s.cfg.hang_first.store(4, Ordering::SeqCst);
+    let mut rx = m.subscribe();
+    let id = add(m, &s.file_url());
+    wait_bytes(&mut rx, &id, 4000).await;
+    id
+}
+
+#[tokio::test]
+async fn pause_then_resume_completes_with_the_right_bytes() {
+    let s = TestServer::start(8 * 1024 * 1024).await;
+    let d = tempfile::tempdir().unwrap();
+    let m = manager(d.path());
+    let id = parked(&s, &m).await;
+    m.pause(&id).unwrap();
+    wait_for(&m, &id, DownloadStatus::Paused).await;
+    let saved: u64 = m.segments(&id).unwrap().iter().map(|x| x.downloaded).sum();
+    assert!(saved >= 4000, "the paused state was saved: {saved}");
+    assert!(d.path().join("file.mdm.part").exists());
+    s.cfg.hang_first.store(0, Ordering::SeqCst);
+    m.resume(&id).unwrap();
+    wait_for(&m, &id, DownloadStatus::Completed).await;
+    assert_eq!(sha256_file(&d.path().join("file")), sha256_bytes(&s.data));
+}
+
+#[tokio::test]
+async fn a_queued_download_pauses_without_starting() {
+    let s = TestServer::start(1024).await;
+    let d = tempfile::tempdir().unwrap();
+    let m = manager(d.path());
+    let id = m
+        .add(NewDownload {
+            url: s.file_url(),
+            start_paused: true,
+            ..Default::default()
+        })
+        .unwrap()
+        .id;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(m.get(&id).unwrap().unwrap().status, DownloadStatus::Paused);
+    assert_eq!(s.cfg.requests.load(Ordering::SeqCst), 0);
+    m.resume(&id).unwrap();
+    wait_for(&m, &id, DownloadStatus::Completed).await;
+}
+
+#[tokio::test]
+async fn cancel_deletes_the_partial_data() {
+    let s = TestServer::start(8 * 1024 * 1024).await;
+    let d = tempfile::tempdir().unwrap();
+    let m = manager(d.path());
+    let id = parked(&s, &m).await;
+    m.cancel(&id).unwrap();
+    wait_for(&m, &id, DownloadStatus::Cancelled).await;
+    assert!(!d.path().join("file.mdm.part").exists());
+    assert!(m.segments(&id).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn remove_while_running_deletes_the_row_and_the_part_file() {
+    let s = TestServer::start(8 * 1024 * 1024).await;
+    let d = tempfile::tempdir().unwrap();
+    let m = manager(d.path());
+    let id = parked(&s, &m).await;
+    let mut rx = m.subscribe();
+    m.remove(&id, false).unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let Ok(ManagerEvent::Removed { id: rid }) = rx.recv().await {
+                if rid == id {
+                    return;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(m.get(&id).unwrap().is_none());
+    assert!(!d.path().join("file.mdm.part").exists());
+}
+
+#[tokio::test]
+async fn remove_a_completed_download_keeps_or_deletes_the_file_on_request() {
+    let s = TestServer::start(1024).await;
+    let d = tempfile::tempdir().unwrap();
+    let m = manager(d.path());
+    let keep = add(&m, &s.file_url());
+    wait_for(&m, &keep, DownloadStatus::Completed).await;
+    m.remove(&keep, false).unwrap();
+    assert!(d.path().join("file").exists());
+    let gone = add(&m, &s.file_url());
+    let row = wait_for(&m, &gone, DownloadStatus::Completed).await;
+    let name = row.filename.unwrap();
+    m.remove(&gone, true).unwrap();
+    assert!(!d.path().join(name).exists());
+    assert!(m.get(&gone).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn restart_starts_a_failed_download_from_zero() {
+    let s = TestServer::start(1024 * 1024).await;
+    let d = tempfile::tempdir().unwrap();
+    let m = manager(d.path());
+    // A probe-level failure is immediate (the probe does not retry): HEAD is
+    // refused and the GET bytes=0-0 fallback answers 503. Segment-level 503s
+    // would retry ten times with the default 1 s base delay — minutes.
+    s.cfg.head_allowed.store(false, Ordering::SeqCst);
+    s.cfg.fail_first.store(1000, Ordering::SeqCst);
+    let id = add(&m, &s.file_url());
+    let row = wait_for(&m, &id, DownloadStatus::Failed).await;
+    assert_eq!(row.error_code.as_deref(), Some("HTTP_STATUS"));
+    s.cfg.head_allowed.store(true, Ordering::SeqCst);
+    s.cfg.fail_first.store(0, Ordering::SeqCst);
+    m.restart(&id).unwrap();
+    wait_for(&m, &id, DownloadStatus::Completed).await;
+    assert_eq!(sha256_file(&d.path().join("file")), sha256_bytes(&s.data));
+    assert_eq!(m.restart(&id).unwrap_err().code(), "INVALID_STATE");
+}
+
+#[tokio::test]
+async fn shutdown_saves_running_downloads_and_queues_them_for_next_launch() {
+    let s = TestServer::start(8 * 1024 * 1024).await;
+    let d = tempfile::tempdir().unwrap();
+    let m = manager(d.path());
+    let id = parked(&s, &m).await;
+    tokio::time::timeout(Duration::from_secs(20), m.shutdown())
+        .await
+        .unwrap();
+    let row = m.get(&id).unwrap().unwrap();
+    assert_eq!(row.status, DownloadStatus::Queued);
+    assert!(row.downloaded >= 4000);
+}
+
+#[tokio::test]
+async fn unknown_ids_are_not_found() {
+    let d = tempfile::tempdir().unwrap();
+    let m = manager(d.path());
+    let x = DownloadId::new();
+    for e in [
+        m.pause(&x),
+        m.resume(&x),
+        m.cancel(&x),
+        m.remove(&x, false),
+        m.restart(&x),
+    ] {
+        assert_eq!(e.unwrap_err().code(), "NOT_FOUND");
+    }
+}

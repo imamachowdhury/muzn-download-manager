@@ -52,6 +52,21 @@ impl Slot {
             control: Arc::new(Mutex::new(None)),
         }
     }
+
+    /// Record the intent, wake a probe waiting on the token, and stop an
+    /// engine control if one is attached: PAUSE/SHUTDOWN pause it, everything
+    /// else (CANCEL, REMOVE) cancels it.
+    fn signal(&self, intent: u8) {
+        self.intent.store(intent, Ordering::SeqCst);
+        self.token.cancel();
+        if let Some(control) = self.control.lock().unwrap().as_ref() {
+            if intent == INTENT_PAUSE || intent == INTENT_SHUTDOWN {
+                control.pause();
+            } else {
+                control.cancel();
+            }
+        }
+    }
 }
 
 pub(crate) struct Inner {
@@ -168,6 +183,140 @@ impl Manager {
         Inner::schedule(&self.inner);
         Ok(row)
     }
+
+    /// Pause: a running download stops and saves its state; a queued one simply waits.
+    pub fn pause(&self, id: &DownloadId) -> Result<()> {
+        if let Some(slot) = self.inner.slot(id) {
+            slot.signal(INTENT_PAUSE);
+            return Ok(());
+        }
+        let row = self.inner.require(id)?;
+        if row.status == DownloadStatus::Queued {
+            self.inner.set_status(id, DownloadStatus::Paused, None)?;
+        }
+        Ok(())
+    }
+
+    /// Resume a paused, failed or cancelled download (a cancelled one starts from zero).
+    pub fn resume(&self, id: &DownloadId) -> Result<()> {
+        if self.inner.slot(id).is_some() {
+            return Ok(());
+        }
+        let row = self.inner.require(id)?;
+        match row.status {
+            DownloadStatus::Paused | DownloadStatus::Failed | DownloadStatus::Cancelled => {
+                self.inner.set_status(id, DownloadStatus::Queued, None)?;
+                Inner::schedule(&self.inner);
+                Ok(())
+            }
+            DownloadStatus::Queued => Ok(()),
+            s => Err(CoreError::InvalidState(format!(
+                "cannot resume a {} download",
+                s.as_str()
+            ))),
+        }
+    }
+
+    /// Cancel: stop and delete the partial data.
+    pub fn cancel(&self, id: &DownloadId) -> Result<()> {
+        if let Some(slot) = self.inner.slot(id) {
+            slot.signal(INTENT_CANCEL);
+            return Ok(());
+        }
+        let row = self.inner.require(id)?;
+        match row.status {
+            DownloadStatus::Completed => {
+                Err(CoreError::InvalidState("the download is complete".into()))
+            }
+            DownloadStatus::Cancelled => Ok(()),
+            _ => {
+                self.inner.discard_partial(&row)?;
+                self.inner.set_status(id, DownloadStatus::Cancelled, None)
+            }
+        }
+    }
+
+    /// Remove from the list; `delete_file` also deletes a finished file.
+    pub fn remove(&self, id: &DownloadId, delete_file: bool) -> Result<()> {
+        if let Some(slot) = self.inner.slot(id) {
+            slot.delete_file.store(delete_file, Ordering::SeqCst);
+            slot.signal(INTENT_REMOVE);
+            return Ok(());
+        }
+        let row = self.inner.require(id)?;
+        self.inner.remove_now(&row, delete_file)
+    }
+
+    /// Start over from byte 0 (after SOURCE_CHANGED, for example).
+    pub fn restart(&self, id: &DownloadId) -> Result<()> {
+        let row = self.inner.require(id)?;
+        if self.inner.slot(id).is_some() {
+            return Err(CoreError::InvalidState(
+                "pause the download before restarting it".into(),
+            ));
+        }
+        if row.status == DownloadStatus::Completed {
+            return Err(CoreError::InvalidState("the download is complete".into()));
+        }
+        self.inner.discard_partial(&row)?;
+        self.inner.set_status(id, DownloadStatus::Queued, None)?;
+        Inner::schedule(&self.inner);
+        Ok(())
+    }
+
+    /// Pause everything queued or running.
+    pub fn pause_all(&self) -> Result<()> {
+        for row in self.list()? {
+            if matches!(
+                row.status,
+                DownloadStatus::Queued | DownloadStatus::Probing | DownloadStatus::Downloading
+            ) {
+                self.pause(&row.id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Resume everything paused.
+    pub fn resume_all(&self) -> Result<()> {
+        for row in self.list()? {
+            if row.status == DownloadStatus::Paused {
+                self.resume(&row.id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Before the app exits: stop scheduling, pause everything running, wait
+    /// until each has saved its state. Those rows are QUEUED again, so they
+    /// continue at the next launch.
+    pub async fn shutdown(&self) {
+        self.inner.closing.store(true, Ordering::SeqCst);
+        let slots: Vec<Slot> = self
+            .inner
+            .running
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        for s in slots {
+            s.signal(INTENT_SHUTDOWN);
+        }
+        let tasks = std::mem::take(&mut *self.inner.tasks.lock().unwrap());
+        for t in tasks {
+            let _ = t.await;
+        }
+    }
+
+    /// Tests only: stop every driver the way a crash would, saving nothing more.
+    #[doc(hidden)]
+    pub fn simulate_crash(&self) {
+        self.inner.closing.store(true, Ordering::SeqCst);
+        for t in self.inner.tasks.lock().unwrap().drain(..) {
+            t.abort();
+        }
+    }
 }
 
 impl Inner {
@@ -179,6 +328,11 @@ impl Inner {
         self.store
             .get(id)?
             .ok_or_else(|| CoreError::NotFound(id.to_string()))
+    }
+
+    /// The running slot for `id`, if it is currently driven.
+    pub(crate) fn slot(&self, id: &DownloadId) -> Option<Slot> {
+        self.running.lock().unwrap().get(id).cloned()
     }
 
     pub(crate) fn set_status(
