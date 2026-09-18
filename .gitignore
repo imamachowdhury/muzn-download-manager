@@ -3,3 +3,7 @@ node_modules/
 dist/
 .env
 *.log
+Cargo.lock.bak
+*.mdm.part
+.pnpm-store/
+.superpowers/
