@@ -514,3 +514,114 @@ async fn pause_resume_pause_ends_paused() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(m.get(&id).unwrap().unwrap().status, DownloadStatus::Paused);
 }
+
+#[tokio::test]
+async fn a_crash_resumes_from_the_saved_segments_at_the_next_launch() {
+    let s = TestServer::start(12 * 1024 * 1024).await;
+    s.cfg.chunk_delay_ms.store(40, Ordering::SeqCst); // ~2 s for the whole file
+    let d = tempfile::tempdir().unwrap();
+    let db = d.path().join("state").join("mdm.db");
+    let a = Manager::open(&db, d.path()).unwrap();
+    a.set_settings(Settings {
+        max_connections: 4,
+        ..a.settings()
+    })
+    .unwrap();
+    let id = add(&a, &s.file_url());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while a.get(&id).unwrap().unwrap().downloaded == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no durable progress was saved"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    a.simulate_crash();
+    // The aborted driver dropped its handle, which pauses the engine; give the
+    // engine's own task a moment to stop writing before a new one opens the file.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    drop(a);
+    {
+        let store = Store::open(&db).unwrap();
+        let row = store.get(&id).unwrap().unwrap();
+        assert_eq!(
+            row.status,
+            DownloadStatus::Downloading,
+            "a crash saves no status"
+        );
+        assert!(
+            store
+                .load_segments(&id)
+                .unwrap()
+                .iter()
+                .map(|x| x.downloaded)
+                .sum::<u64>()
+                > 0
+        );
+    }
+    s.cfg.chunk_delay_ms.store(0, Ordering::SeqCst);
+    let before = s.cfg.requests.load(Ordering::SeqCst);
+    let b = Manager::open(&db, d.path()).unwrap();
+    wait_for(&b, &id, DownloadStatus::Completed).await;
+    assert_eq!(sha256_file(&d.path().join("file")), sha256_bytes(&s.data));
+    assert!(s.cfg.requests.load(Ordering::SeqCst) > before);
+}
+
+#[tokio::test]
+async fn a_server_that_lost_ranges_is_restarted_once_as_one_stream() {
+    let s = TestServer::start(8 * 1024 * 1024).await;
+    let d = tempfile::tempdir().unwrap();
+    let m = manager(d.path());
+    let id = parked(&s, &m).await;
+    m.pause(&id).unwrap();
+    wait_for(&m, &id, DownloadStatus::Paused).await;
+    s.cfg.hang_first.store(0, Ordering::SeqCst);
+    s.cfg.ranges.store(false, Ordering::SeqCst);
+    let mut rx = m.subscribe();
+    m.resume(&id).unwrap();
+    wait_for(&m, &id, DownloadStatus::Completed).await;
+    assert_eq!(sha256_file(&d.path().join("file")), sha256_bytes(&s.data));
+    let mut noticed = false;
+    while let Ok(ev) = rx.try_recv() {
+        noticed |= matches!(ev, ManagerEvent::Notice { id: ref n, .. } if n == &id);
+    }
+    assert!(noticed, "the user was told the download started over");
+}
+
+#[tokio::test]
+async fn a_changed_file_waits_for_the_user_to_restart() {
+    let s = TestServer::start(8 * 1024 * 1024).await;
+    let d = tempfile::tempdir().unwrap();
+    let m = manager(d.path());
+    let id = parked(&s, &m).await;
+    m.pause(&id).unwrap();
+    wait_for(&m, &id, DownloadStatus::Paused).await;
+    s.cfg.hang_first.store(0, Ordering::SeqCst);
+    *s.cfg.etag.lock().unwrap() = "\"v2\"".into();
+    m.resume(&id).unwrap();
+    let row = wait_for(&m, &id, DownloadStatus::Failed).await;
+    assert_eq!(row.error_code.as_deref(), Some("SOURCE_CHANGED"));
+    m.restart(&id).unwrap();
+    wait_for(&m, &id, DownloadStatus::Completed).await;
+    assert_eq!(sha256_file(&d.path().join("file")), sha256_bytes(&s.data));
+}
+
+#[tokio::test]
+async fn settings_survive_a_restart_of_the_app() {
+    let d = tempfile::tempdir().unwrap();
+    let db = d.path().join("mdm.db");
+    let a = Manager::open(&db, d.path()).unwrap();
+    a.set_settings(Settings {
+        max_parallel: 5,
+        max_connections: 12,
+        ..a.settings()
+    })
+    .unwrap();
+    drop(a);
+    let b = Manager::open(&db, Path::new("/somewhere/else")).unwrap();
+    let s = b.settings();
+    assert_eq!(
+        (s.max_parallel, s.max_connections, s.download_dir.as_path()),
+        (5, 12, d.path())
+    );
+}

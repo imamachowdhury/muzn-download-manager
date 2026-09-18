@@ -600,18 +600,27 @@ impl Run {
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    let p = self.progress(0, Status::Downloading);
-                    let speed = meter.push(p.downloaded);
-                    tx.send_replace(Progress { speed_bps: speed, ..p });
+                    // Sync BEFORE computing and sending this tick's `Progress`:
+                    // a consumer that persists `durable_segments` only once a
+                    // second of its own (the manager's `PERSIST_INTERVAL`)
+                    // reads whatever this tick carries. Sending the OLD
+                    // (pre-sync) durable snapshot here used to waste that
+                    // consumer's first save on stale (often all-zero) data,
+                    // pushing its next opportunity a full `PERSIST_INTERVAL`
+                    // later — long enough to miss a short download entirely
+                    // (Task 11 review, 2026-09-19). The snapshot is still
+                    // taken BEFORE the fsync: every byte it counts was written
+                    // before it, so the sync covers it. The `Arc<PartFile>`
+                    // clone lives only inside `sync_to`, so `Arc::try_unwrap`
+                    // below still works.
                     if last_sync.elapsed() >= SYNC_INTERVAL {
-                        // The snapshot is taken BEFORE the fsync: every byte
-                        // it counts was written before it, so the sync covers
-                        // it. The `Arc<PartFile>` clone lives only inside
-                        // `sync_to`, so `Arc::try_unwrap` below still works.
                         let snap = self.snapshot();
                         self.sync_to(snap).await;
                         last_sync = Instant::now();
                     }
+                    let p = self.progress(0, Status::Downloading);
+                    let speed = meter.push(p.downloaded);
+                    tx.send_replace(Progress { speed_bps: speed, ..p });
                 }
                 res = set.join_next() => match res {
                     None => break,
