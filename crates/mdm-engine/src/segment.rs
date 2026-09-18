@@ -17,7 +17,7 @@ use crate::file::PartFile;
 use crate::plan::SegmentState;
 use crate::request::RequestExtras;
 
-/// Attempts per segment before the download fails.
+/// Attempts in a row without progress before the segment fails.
 pub const RETRY_MAX_ATTEMPTS: u32 = 10;
 /// Longest backoff between attempts.
 pub const RETRY_CAP: Duration = Duration::from_secs(60);
@@ -115,15 +115,25 @@ pub async fn fetch_segment(job: SegmentJob) -> Result<(), EngineError> {
         if job.cancel.is_cancelled() {
             return Err(EngineError::Cancelled);
         }
-        match attempt_once(&job).await {
+        let mut wrote = 0u64;
+        match attempt_once(&job, &mut wrote).await {
             Ok(()) => return Ok(()),
-            Err(e) if e.is_transient() && attempt + 1 < RETRY_MAX_ATTEMPTS => {
+            Err(e) if e.is_transient() => {
+                // Owner decision 2026-09-18: an attempt that moved the download
+                // forward resets the budget — only attempts in a row that wrote
+                // nothing count towards RETRY_MAX_ATTEMPTS.
+                if wrote > 0 {
+                    attempt = 0;
+                }
                 attempt += 1;
+                if attempt >= RETRY_MAX_ATTEMPTS {
+                    return Err(e);
+                }
                 let delay = job
                     .retry_base_delay
                     .saturating_mul(1 << (attempt - 1).min(20))
                     .min(RETRY_CAP);
-                tracing::debug!(idx = job.seg.idx, attempt, ?delay, error = %e, "segment retry");
+                tracing::debug!(idx = job.seg.idx, attempt, wrote, ?delay, error = %e, "segment retry");
                 tokio::select! {
                     _ = job.cancel.cancelled() => return Err(EngineError::Cancelled),
                     _ = tokio::time::sleep(delay) => {}
@@ -134,7 +144,7 @@ pub async fn fetch_segment(job: SegmentJob) -> Result<(), EngineError> {
     }
 }
 
-async fn attempt_once(job: &SegmentJob) -> Result<(), EngineError> {
+async fn attempt_once(job: &SegmentJob, wrote: &mut u64) -> Result<(), EngineError> {
     let seg = &job.seg;
     let next = if job.ranged {
         seg.next_offset()
@@ -224,6 +234,7 @@ async fn attempt_once(job: &SegmentJob) -> Result<(), EngineError> {
         }
         job.file.write_at(pos, buf).map_err(EngineError::from_io)?;
         pos += buf.len() as u64;
+        *wrote += buf.len() as u64;
         seg.downloaded.store(pos - seg.start, Ordering::SeqCst);
         if end != UNKNOWN_END && pos > end {
             break;

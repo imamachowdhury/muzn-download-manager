@@ -679,13 +679,12 @@ checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 name = "mdm-engine"
 version = "0.1.0"
 dependencies = [
- "axum",
  "bytes",
  "futures-util",
+ "mdm-test-server",
  "percent-encoding",
  "proptest",
  "reqwest",
- "sha2",
  "tempfile",
  "thiserror",
  "tokio",
@@ -693,6 +692,18 @@ dependencies = [
  "tokio-util",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "mdm-test-server"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "futures-util",
+ "reqwest",
+ "sha2",
+ "tokio",
 ]
 
 [[package]]

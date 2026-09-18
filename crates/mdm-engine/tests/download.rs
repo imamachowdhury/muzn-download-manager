@@ -162,7 +162,7 @@ async fn survives_503_burst_and_connection_drops() {
 async fn permanent_mid_download_failure_reports_and_keeps_part() {
     let s = TestServer::start(2 * 1024 * 1024).await;
     let d = tempfile::tempdir().unwrap();
-    s.cfg.drop_after.store(1, Ordering::SeqCst); // every body dies → 10 attempts → NETWORK
+    s.cfg.fail_first.store(1000, Ordering::SeqCst); // every GET answers 503 → 10 attempts without progress
     let h = engine(2)
         .start(spec(&s.file_url(), d.path()))
         .await
@@ -171,7 +171,7 @@ async fn permanent_mid_download_failure_reports_and_keeps_part() {
     let Outcome::Failed { error, segments } = h.wait().await else {
         panic!()
     };
-    assert_eq!(error.code(), "NETWORK");
+    assert_eq!(error.code(), "HTTP_STATUS");
     assert_eq!(segments.len(), 2);
     assert!(part.exists(), "the part file stays for a later resume");
 }
