@@ -537,9 +537,31 @@ async fn a_crash_resumes_from_the_saved_segments_at_the_next_launch() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     a.simulate_crash();
-    // The aborted driver dropped its handle, which pauses the engine; give the
-    // engine's own task a moment to stop writing before a new one opens the file.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The aborted driver dropped its handle, which pauses the engine. Final
+    // review 2026-09-19: a fixed 500 ms sleep here raced a slow runner; wait
+    // (up to 10 s) until neither the server's request count nor the saved
+    // segments have moved for 300 ms, so the engine's own task (and its last
+    // durable save) has stopped before a new one opens the file.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let state = || {
+        (
+            s.cfg.requests.load(Ordering::SeqCst),
+            a.segments(&id).unwrap(),
+        )
+    };
+    let mut seen = state();
+    loop {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let now = state();
+        if now == seen {
+            break;
+        }
+        seen = now;
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the crashed engine kept making requests"
+        );
+    }
     drop(a);
     {
         let store = Store::open(&db).unwrap();
@@ -589,6 +611,52 @@ async fn a_server_that_lost_ranges_is_restarted_once_as_one_stream() {
 }
 
 #[tokio::test]
+async fn a_server_that_ignores_real_ranges_is_restarted_as_one_stream() {
+    // Final review 2026-09-19: the probe's bytes=0-0 gets a 206 but real
+    // ranged GETs get a 200; the "one stream" retry was segmented again and
+    // failed a second time.
+    let s = TestServer::start(4 * 1024 * 1024).await;
+    s.cfg.head_allowed.store(false, Ordering::SeqCst);
+    s.cfg.ranges_only_probe.store(true, Ordering::SeqCst);
+    let d = tempfile::tempdir().unwrap();
+    let m = manager(d.path());
+    let mut rx = m.subscribe();
+    let id = add(&m, &s.file_url());
+    let row = wait_for_any(
+        &m,
+        &id,
+        &[DownloadStatus::Completed, DownloadStatus::Failed],
+    )
+    .await;
+    assert_eq!(
+        (row.status, row.error_code.as_deref()),
+        (DownloadStatus::Completed, None)
+    );
+    assert_eq!(sha256_file(&d.path().join("file")), sha256_bytes(&s.data));
+    let mut noticed = false;
+    while let Ok(ev) = rx.try_recv() {
+        noticed |= matches!(ev, ManagerEvent::Notice { id: ref n, .. } if n == &id);
+    }
+    assert!(noticed, "the user was told the download started over");
+}
+
+/// Wait until the row reaches any of `want`.
+async fn wait_for_any(m: &Manager, id: &DownloadId, want: &[DownloadStatus]) -> DownloadRow {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let row = m.get(id).unwrap().unwrap();
+        if want.contains(&row.status) {
+            return row;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {want:?}; last row: {row:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
 async fn a_changed_file_waits_for_the_user_to_restart() {
     let s = TestServer::start(8 * 1024 * 1024).await;
     let d = tempfile::tempdir().unwrap();
@@ -602,6 +670,99 @@ async fn a_changed_file_waits_for_the_user_to_restart() {
     let row = wait_for(&m, &id, DownloadStatus::Failed).await;
     assert_eq!(row.error_code.as_deref(), Some("SOURCE_CHANGED"));
     m.restart(&id).unwrap();
+    wait_for(&m, &id, DownloadStatus::Completed).await;
+    assert_eq!(sha256_file(&d.path().join("file")), sha256_bytes(&s.data));
+}
+
+#[tokio::test]
+async fn a_callers_file_name_cannot_leave_the_download_folder() {
+    // Final review 2026-09-19: `NewDownload.filename` was stored verbatim and
+    // joined onto `dir`, so `../evil`, `/abs/x` or `C:\x` wrote outside it.
+    let s = TestServer::start(1000).await;
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("downloads");
+    let m = manager(&dir);
+    for name in ["../evil", "/abs/x", "C:\\x"] {
+        let row = m
+            .add(NewDownload {
+                url: s.file_url(),
+                filename: Some(name.into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let stored = row.filename.clone().unwrap();
+        assert!(
+            !stored.contains(['/', '\\', ':']),
+            "{name:?} was stored as {stored:?}"
+        );
+        let done = wait_for(&m, &row.id, DownloadStatus::Completed).await;
+        let file = dir.join(done.filename.unwrap());
+        assert_eq!(file.parent().unwrap(), dir.as_path());
+        assert_eq!(sha256_file(&file), sha256_bytes(&s.data));
+    }
+    assert!(!root.path().join("evil").exists());
+}
+
+/// Final review 2026-09-19: removing a COMPLETED / CANCELLED row deleted
+/// `dir/<name>.mdm.part` whatever its status — a newer download of the same
+/// URL (not reserved against a finished row) may own that very part file.
+async fn removing_a_finished_row_spares_a_newer_ones_part(cancel_first: bool) {
+    let s = TestServer::start(8 * 1024 * 1024).await;
+    let d = tempfile::tempdir().unwrap();
+    let m = manager(d.path());
+    let first = if cancel_first {
+        let id = parked(&s, &m).await;
+        m.cancel(&id).unwrap();
+        wait_for(&m, &id, DownloadStatus::Cancelled).await;
+        assert!(!d.path().join("file.mdm.part").exists());
+        s.cfg.hang_first.store(0, Ordering::SeqCst);
+        id
+    } else {
+        let id = add(&m, &s.file_url());
+        wait_for(&m, &id, DownloadStatus::Completed).await;
+        id
+    };
+    let second = parked(&s, &m).await;
+    let part = d.path().join("file.mdm.part");
+    assert!(part.exists(), "the second download owns file.mdm.part");
+    m.remove(&first, false).unwrap();
+    assert!(
+        part.exists(),
+        "removing the first row deleted the second's part"
+    );
+    m.pause(&second).unwrap();
+    wait_for(&m, &second, DownloadStatus::Paused).await;
+    assert!(part.exists());
+    s.cfg.hang_first.store(0, Ordering::SeqCst);
+    m.resume(&second).unwrap();
+    let row = wait_for(&m, &second, DownloadStatus::Completed).await;
+    assert_eq!(
+        sha256_file(&d.path().join(row.filename.unwrap())),
+        sha256_bytes(&s.data)
+    );
+}
+
+#[tokio::test]
+async fn removing_a_completed_row_never_deletes_a_newer_downloads_part() {
+    removing_a_finished_row_spares_a_newer_ones_part(false).await;
+}
+
+#[tokio::test]
+async fn removing_a_cancelled_row_never_deletes_a_newer_downloads_part() {
+    removing_a_finished_row_spares_a_newer_ones_part(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn add_works_from_a_thread_outside_the_runtime() {
+    // Final review 2026-09-19 (Plan 3 readiness): Tauri's setup hook and sync
+    // commands run outside the tokio runtime, where `tokio::spawn` panics.
+    let s = TestServer::start(1024 * 1024).await;
+    let d = tempfile::tempdir().unwrap();
+    let m = manager(d.path());
+    let (m2, url) = (m.clone(), s.file_url());
+    let id = std::thread::spawn(move || add(&m2, &url))
+        .join()
+        .expect("add from a plain thread must not panic");
     wait_for(&m, &id, DownloadStatus::Completed).await;
     assert_eq!(sha256_file(&d.path().join("file")), sha256_bytes(&s.data));
 }

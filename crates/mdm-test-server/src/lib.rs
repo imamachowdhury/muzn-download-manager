@@ -47,6 +47,11 @@ pub struct ServerCfg {
     /// `true`: the status is still `206`, but the header is left off — a
     /// server that lies about answering ranges.
     pub omit_content_range: AtomicBool,
+    /// `false` (default): every honoured `Range` gets its `206`. `true`: only
+    /// the probe's exact `bytes=0-0` gets a `206`; every other ranged GET is
+    /// answered `200` with the whole body — a server that passes the range
+    /// probe and then ignores real ranges.
+    pub ranges_only_probe: AtomicBool,
 }
 
 impl Default for ServerCfg {
@@ -66,6 +71,7 @@ impl Default for ServerCfg {
             advertise_ranges: AtomicBool::new(true),
             chunked: AtomicBool::new(false),
             omit_content_range: AtomicBool::new(false),
+            ranges_only_probe: AtomicBool::new(false),
         }
     }
 }
@@ -160,10 +166,13 @@ async fn file(State(s): State<AppState>, method: Method, headers: HeaderMap) -> 
     // honoured either way, whatever `cfg.ranges` says.
     let chunked = cfg.chunked.load(Ordering::SeqCst);
     let ranges = cfg.ranges.load(Ordering::SeqCst) && !chunked;
+    let only_probe = cfg.ranges_only_probe.load(Ordering::SeqCst);
     let range = if ranges {
         headers
             .get(header::RANGE)
-            .and_then(|v| parse_range(v.to_str().ok()?, total))
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| !only_probe || *v == "bytes=0-0")
+            .and_then(|v| parse_range(v, total))
     } else {
         None
     };

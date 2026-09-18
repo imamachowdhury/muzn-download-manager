@@ -116,6 +116,10 @@ pub(crate) struct Inner {
     pub(crate) tasks: Mutex<Vec<JoinHandle<()>>>,
     pub(crate) closing: AtomicBool,
     events: broadcast::Sender<ManagerEvent>,
+    /// The runtime every driver is spawned on, captured when the manager is
+    /// opened: the sync methods (`add`, `resume`, …) may then be called from
+    /// any thread, inside a runtime or not (Tauri's setup hook, sync commands).
+    rt: tokio::runtime::Handle,
 }
 
 /// The download manager. Cheap to clone; clones share one queue.
@@ -126,13 +130,21 @@ pub struct Manager {
 
 impl Manager {
     /// Open the database, put downloads interrupted by a crash or a quit back
-    /// in the queue, and start it. Call inside a tokio runtime.
+    /// in the queue, and start it.
+    ///
+    /// Call this once from inside a tokio runtime: the manager keeps that
+    /// runtime's handle and spawns every download on it, so every other
+    /// method may then be called from any thread, inside a runtime or not.
+    /// Outside a runtime it fails with INVALID_STATE.
     pub fn open(db: &Path, default_download_dir: &Path) -> Result<Manager> {
         Self::with_store(Store::open(db)?, default_download_dir)
     }
 
-    /// The same over an already opened store.
+    /// The same over an already opened store (same runtime rule as `open`).
     pub fn with_store(store: Store, default_download_dir: &Path) -> Result<Manager> {
+        let rt = tokio::runtime::Handle::try_current().map_err(|_| {
+            CoreError::InvalidState("the manager must be opened inside a tokio runtime".into())
+        })?;
         let settings = store.load_settings(default_download_dir)?.validated()?;
         let engine = Engine::new(settings.engine_config()?)?;
         store.reset_interrupted(now_ms())?;
@@ -145,6 +157,7 @@ impl Manager {
             tasks: Mutex::default(),
             closing: AtomicBool::new(false),
             events,
+            rt,
         });
         Inner::schedule(&inner);
         Ok(Manager { inner })
@@ -178,8 +191,8 @@ impl Manager {
 
     /// Validate, save and apply settings. Running downloads keep their engine;
     /// new ones use the new settings. More parallel slots start queued rows at once.
-    /// The new engine shares the old one's live part claims. Call inside a
-    /// tokio runtime (it may start downloads).
+    /// The new engine shares the old one's live part claims. Callable from
+    /// any thread (downloads it starts run on the manager's runtime).
     pub fn set_settings(&self, s: Settings) -> Result<Settings> {
         let s = s.validated()?;
         let current = self.inner.engine.lock().unwrap().clone();
@@ -191,8 +204,9 @@ impl Manager {
         Ok(s)
     }
 
-    /// Add a download (QUEUED, or PAUSED with `start_paused`). Call inside a
-    /// tokio runtime (it may start downloads).
+    /// Add a download (QUEUED, or PAUSED with `start_paused`). Callable from
+    /// any thread (downloads it starts run on the manager's runtime). A
+    /// caller's `filename` is sanitised (`mdm_engine::filename::sanitize`).
     pub fn add(&self, mut new: NewDownload) -> Result<DownloadRow> {
         let url = Url::parse(new.url.trim())
             .map_err(|e| CoreError::InvalidUrl(format!("{}: {e}", new.url)))?;
@@ -203,6 +217,15 @@ impl Manager {
             )));
         }
         new.url = url.to_string();
+        // A caller's file name is joined onto `dir`: sanitise it so `../x`,
+        // `/abs/x` or `C:\x` can never write outside the folder. A blank
+        // name means "use the probed one".
+        new.filename = new
+            .filename
+            .as_deref()
+            .map(str::trim)
+            .filter(|f| !f.is_empty())
+            .map(mdm_engine::filename::sanitize);
         let dir = new
             .dir
             .clone()
@@ -452,14 +475,26 @@ impl Inner {
     }
 
     /// Delete the part file (if any) and the saved segments.
+    ///
+    /// A COMPLETED or CANCELLED row owns no part file any more (it was
+    /// renamed, or deleted at cancel time) and is not reserved
+    /// (`reserved_parts`), so a newer download of the same name may own
+    /// `<name>.mdm.part` now: only its segments are cleared, never a file.
     pub(crate) fn discard_partial(&self, row: &DownloadRow) -> Result<()> {
-        if let Some(p) = Self::part_path(row) {
-            remove_if_present(&p)?;
+        let owns_part = !matches!(
+            row.status,
+            DownloadStatus::Completed | DownloadStatus::Cancelled
+        );
+        if owns_part {
+            if let Some(p) = Self::part_path(row) {
+                remove_if_present(&p)?;
+            }
         }
         self.store.clear_segments(&row.id)
     }
 
-    /// Delete the row now (not running): part file always, the finished file on request.
+    /// Delete the row now (not running): its own part file (`discard_partial`
+    /// — never one a finished row no longer owns), the finished file on request.
     pub(crate) fn remove_now(&self, row: &DownloadRow, delete_file: bool) -> Result<()> {
         self.discard_partial(row)?;
         if delete_file && row.status == DownloadStatus::Completed {
@@ -549,7 +584,9 @@ impl Inner {
             let Some(id) = next else { return };
             let slot = Slot::new();
             running.insert(id.clone(), slot.clone());
-            let task = tokio::spawn(drive(this.clone(), id, slot));
+            // `rt.spawn`, not `tokio::spawn`: the caller may be a thread
+            // outside the runtime (see `Inner::rt`).
+            let task = this.rt.spawn(drive(this.clone(), id, slot));
             let mut tasks = this.tasks.lock().unwrap();
             tasks.retain(|t| !t.is_finished());
             tasks.push(task);
@@ -588,6 +625,8 @@ fn extras_of(row: &DownloadRow) -> RequestExtras {
 }
 
 /// The saved state no longer fits the server: start over from byte 0 (once).
+/// Never `PartInUse`: that part file belongs to a live download, so the row
+/// fails with PART_IN_USE and nothing is deleted.
 fn needs_fresh_start(e: &EngineError) -> bool {
     matches!(
         e,
@@ -610,6 +649,9 @@ async fn drive(inner: Arc<Inner>, id: DownloadId, slot: Slot) {
 
 async fn drive_inner(inner: &Arc<Inner>, id: &DownloadId, slot: &Slot) -> Result<()> {
     let mut started_over = false;
+    // Set by the mid-download RANGE_NOT_SUPPORTED fallback: the retry must be
+    // one plain GET, since the probe already said "ranges" once and lied.
+    let mut single_stream = false;
     let mut first_pass = true;
     loop {
         let Some(row) = inner.store.get(id)? else {
@@ -644,6 +686,7 @@ async fn drive_inner(inner: &Arc<Inner>, id: &DownloadId, slot: &Slot) -> Result
             extras: extras_of(&row),
             resume_from: resume,
             reserved: inner.reserved_parts(&row)?,
+            single_stream,
         };
         let engine = inner.engine.lock().unwrap().clone();
         let started = tokio::select! {
@@ -680,7 +723,7 @@ async fn drive_inner(inner: &Arc<Inner>, id: &DownloadId, slot: &Slot) -> Result
             INTENT_PAUSE | INTENT_SHUTDOWN => handle.pause(),
             _ => handle.cancel(),
         }
-        let forwarder = tokio::spawn(forward_progress(
+        let forwarder = inner.rt.spawn(forward_progress(
             inner.clone(),
             id.clone(),
             handle.subscribe(),
@@ -714,6 +757,7 @@ async fn drive_inner(inner: &Arc<Inner>, id: &DownloadId, slot: &Slot) -> Result
                 if slot.intent.load(Ordering::SeqCst) == INTENT_NONE {
                     if matches!(error, EngineError::RangeNotSupported) && !started_over {
                         started_over = true;
+                        single_stream = true;
                         let row = inner.require(id)?;
                         inner.discard_partial(&row)?;
                         inner.notice(
@@ -749,5 +793,21 @@ async fn forward_progress(inner: Arc<Inner>, id: DownloadId, mut rx: watch::Rece
             }
             last_save = Instant::now();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_part_in_use_is_never_a_reason_to_start_over() {
+        // Final review 2026-09-19: "start over" deletes the part file, and a
+        // part in use belongs to another live download.
+        assert!(!needs_fresh_start(&EngineError::PartInUse(
+            "file.mdm.part".into()
+        )));
+        assert!(needs_fresh_start(&EngineError::InvalidResume("x".into())));
+        assert!(needs_fresh_start(&EngineError::RangeNotSupported));
     }
 }

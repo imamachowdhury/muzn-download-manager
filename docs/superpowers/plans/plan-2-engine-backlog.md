@@ -7,7 +7,12 @@ Closed by Plan 2: the retry reset, credential strip, engine-owned headers, durab
 exclusive part names, blocking writes, hidden range support, empty unknown-length stream, bare
 206, StopOnDrop cancel, checked resume math, pause-after-last-byte, INTERNAL code, the `== 6` pin,
 the speed assertion (the mid-download 200 fallback is closed too, by the manager's automatic
-fresh start). Still open:
+fresh start as one plain GET — `DownloadSpec::single_stream`). The final whole-branch review
+(2026-09-19) closed: sanitised caller file names (core and engine), no foreign part deletion
+when a finished/cancelled row is removed, the real one-stream fallback, `PART_IN_USE` (fails,
+never deletes), the `finish()` free-name-then-rename race (`FINISH_LOCK`), the manager's own
+runtime handle (sync calls from outside the runtime), the SQLite busy timeout, and the crash
+test's fixed sleep. Still open:
 
 ## Error codes
 
@@ -26,8 +31,6 @@ fresh start). Still open:
 
 ## Found during Plan 2's reviews
 
-- `finish()` has a free-name-then-rename race: two downloads that finish with the same name at
-  the same moment can both pick the same free name before either renames into it.
 - The live-part registry's keys, and the manager's `r.dir == row.dir` comparison in
   `reserved_parts`, are not normalised — two spellings of the same Windows path (`C:\x` vs
   `c:\X\`) are treated as different folders.

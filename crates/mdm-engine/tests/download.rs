@@ -23,6 +23,7 @@ fn spec(url: &str, dir: &std::path::Path) -> DownloadSpec {
         extras: RequestExtras::default(),
         resume_from: None,
         reserved: Vec::new(),
+        single_stream: false,
     }
 }
 
@@ -79,6 +80,26 @@ async fn single_stream_when_ranges_off() {
     // settles the question, so the probe also does its GET Range: bytes=0-0
     // fallback before the real single-stream fetch — two GETs, not one.
     assert_eq!(s.cfg.requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn single_stream_makes_one_plain_get_even_when_ranges_work() {
+    // Final review 2026-09-19: the manager's "restart as one stream" fallback
+    // was planned as segmented again on a server that advertises ranges.
+    let s = TestServer::start(4 * 1024 * 1024).await;
+    let d = tempfile::tempdir().unwrap();
+    let mut sp = spec(&s.file_url(), d.path());
+    sp.single_stream = true;
+    let h = engine(8).start(sp).await.unwrap();
+    assert!(h.probe().ranges, "the server does advertise ranges");
+    let after_probe = s.cfg.requests.load(Ordering::SeqCst);
+    let rx = h.subscribe();
+    let Outcome::Completed(path) = h.wait().await else {
+        panic!()
+    };
+    assert_eq!(sha256_file(&path), sha256_bytes(&s.data));
+    assert_eq!(rx.borrow().segments.len(), 1);
+    assert_eq!(s.cfg.requests.load(Ordering::SeqCst) - after_probe, 1);
 }
 
 #[tokio::test]
@@ -156,6 +177,25 @@ async fn explicit_filename_and_clash() {
     };
     assert_eq!(path.file_name().unwrap(), "x (1).bin");
     assert_eq!(std::fs::read(d.path().join("x.bin")).unwrap(), b"old");
+}
+
+#[tokio::test]
+async fn a_callers_file_name_cannot_leave_the_folder() {
+    // Final review 2026-09-19: a caller's name was joined onto `dir` verbatim,
+    // so `../evil` wrote outside the download folder.
+    let s = TestServer::start(1000).await;
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("downloads");
+    let mut sp = spec(&s.file_url(), &dir);
+    sp.filename = Some("../evil".into());
+    let h = engine(2).start(sp).await.unwrap();
+    assert!(!h.filename().contains(['/', '\\']), "{}", h.filename());
+    let Outcome::Completed(path) = h.wait().await else {
+        panic!()
+    };
+    assert_eq!(path.parent().unwrap(), dir.as_path());
+    assert_eq!(sha256_file(&path), sha256_bytes(&s.data));
+    assert!(!root.path().join("evil").exists());
 }
 
 #[tokio::test]

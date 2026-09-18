@@ -13,13 +13,22 @@ its size once completed.
 
 ## The manager
 
+- **Runtime:** `Manager::open` / `with_store` must be called once from inside a tokio runtime; the
+  manager keeps that runtime's handle and spawns every download on it, so every other method may be
+  called from any thread, inside a runtime or not (Tauri's setup hook and sync commands).
 - **Queue:** FIFO by creation time, at most `max_parallel` (default 3) running.
+- **File names from callers** (`NewDownload.filename`) are sanitised on `add`
+  (`mdm_engine::filename::sanitize`, and again by the engine): `../x`, `/abs/x` or `C:\x` can never
+  write outside the download folder. A blank name means "use the probed one".
 - **Driving a download:** PROBING → the engine starts (resuming when the row has a size and saved
   segments) → DOWNLOADING → COMPLETED or FAILED with the engine's error code. The durable segment
   snapshot is saved every second (only bytes that reached the disk).
 - **Pause / resume / cancel / remove / restart:** a running download is reached through its engine
   control; a waiting one only changes state. Cancel deletes the partial data; remove deletes the row
-  (and the finished file only on request); restart starts from byte 0.
+  (and the finished file only on request); restart starts from byte 0. A COMPLETED or CANCELLED
+  row owns no part file any more (renamed, or deleted at cancel time) and is not reserved, so a
+  newer download of the same name may own `<name>.mdm.part`: removing (or restarting) such a row
+  clears its saved segments only and never touches a part file.
 - **Control signals rank:** REMOVE beats CANCEL beats SHUTDOWN beats PAUSE beats NONE — a signal
   only ever raises a slot's intent to a higher rank, so a later, weaker request (say a PAUSE after
   a CANCEL already won) can never override the earlier, stronger one. Every stop request (pause,
@@ -41,8 +50,11 @@ its size once completed.
   next launch.
 - **Starting over by itself, once:** a resume refused because the server lost range support, the saved
   state does not fit (`INVALID_RESUME`) or the part file is gone — and a download whose server stops
-  honouring ranges mid-way — restart from byte 0 with a `Notice`. A changed file (`SOURCE_CHANGED`)
-  never does: it waits in FAILED for the user's `restart`.
+  honouring ranges mid-way — restart from byte 0 with a `Notice`. The mid-way case restarts as one
+  plain GET (`DownloadSpec::single_stream`), because the probe already claimed ranges once and a
+  segmented retry would fail the same way. A changed file (`SOURCE_CHANGED`) never does: it waits in
+  FAILED for the user's `restart`. Nor does a resume whose part file another live download is
+  writing (`PART_IN_USE`): the row fails with that code and nothing is deleted.
 - **Retry, inside a segment** (owner, 2026-09-18): the engine fails a segment after ten attempts in
   a row that wrote no bytes; any attempt that makes progress resets that count and the backoff. The
   manager never retries on its own — a FAILED row is always the engine giving up on a segment, or a

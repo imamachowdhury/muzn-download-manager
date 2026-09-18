@@ -2,11 +2,15 @@
 
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use crate::error::EngineError;
 
 /// Suffix of an in-progress download.
 pub const PART_SUFFIX: &str = ".mdm.part";
+
+/// Held across "pick a free name + rename" in [`PartFile::finish`], process-wide.
+static FINISH_LOCK: Mutex<()> = Mutex::new(());
 
 /// An open part file; cheap to share behind an `Arc`.
 pub struct PartFile {
@@ -78,11 +82,21 @@ impl PartFile {
         &self.part_path
     }
 
-    /// fsync, then rename to the final name; an existing file is never overwritten.
+    /// fsync, then rename to the final name (`name (n).ext` when it is
+    /// taken). A file that exists — or that another `finish()` in this
+    /// process is claiming at the same moment — is never overwritten.
     pub fn finish(self) -> Result<PathBuf, EngineError> {
         self.file.sync_all().map_err(EngineError::from_io)?;
+        // Windows will not rename an open file.
+        drop(self.file);
+
+        // "Pick a free name" and "rename onto it" are one step for every
+        // download in this process: `rename` replaces an existing file, so
+        // two same-name downloads finishing together would otherwise pick
+        // the same free name and one would overwrite the other. The fsync
+        // above stays outside the lock.
+        let _finishing = FINISH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let target = free_name(&self.dir, &self.filename);
-        drop(self.file); // Windows will not rename an open file
         std::fs::rename(&self.part_path, &target).map_err(EngineError::from_io)?;
         Ok(target)
     }
@@ -171,6 +185,39 @@ mod tests {
         std::fs::write(d.path().join("README (1)"), b"").unwrap();
         let f = PartFile::open(d.path(), "README", None).unwrap();
         assert_eq!(f.finish().unwrap().file_name().unwrap(), "README (2)");
+    }
+
+    #[test]
+    fn two_same_name_finishes_at_once_never_overwrite_each_other() {
+        // Final review 2026-09-19: `finish()` picked a free name, then renamed;
+        // two finishing together picked the same name and one rename replaced
+        // the other's file.
+        for _ in 0..200 {
+            let d = tempfile::tempdir().unwrap();
+            let parts: Vec<PartFile> = ["p1", "p2"]
+                .iter()
+                .map(|p| {
+                    let mut f = PartFile::open(d.path(), p, Some(1)).unwrap();
+                    f.filename = "same.bin".into();
+                    f
+                })
+                .collect();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let threads: Vec<_> = parts
+                .into_iter()
+                .map(|f| {
+                    let b = barrier.clone();
+                    std::thread::spawn(move || {
+                        b.wait();
+                        f.finish().unwrap()
+                    })
+                })
+                .collect();
+            let outs: Vec<PathBuf> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+            assert_ne!(outs[0], outs[1]);
+            let files = std::fs::read_dir(d.path()).unwrap().count();
+            assert_eq!(files, 2, "both finished files exist");
+        }
     }
 
     #[test]

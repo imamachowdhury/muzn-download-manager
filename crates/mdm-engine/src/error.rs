@@ -34,6 +34,12 @@ pub enum EngineError {
     /// cover it, or a part file of the wrong length); start over.
     #[error("invalid resume state: {0}")]
     InvalidResume(String),
+    /// A resume whose part file is being written by another live download
+    /// right now. Nothing is wrong with the saved state, and the part file
+    /// belongs to the live download: never delete it; try again once that
+    /// download has stopped.
+    #[error("the part file {} is in use by another download", .0.display())]
+    PartInUse(std::path::PathBuf),
     /// Any other I/O failure.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -85,6 +91,7 @@ impl EngineError {
             Self::Tls(_) => "TLS",
             Self::Cancelled => "CANCELLED",
             Self::InvalidResume(_) => "INVALID_RESUME",
+            Self::PartInUse(_) => "PART_IN_USE",
             Self::Io(_) => "IO",
             Self::Internal(_) => "INTERNAL",
         }
@@ -154,6 +161,12 @@ mod tests {
             "INVALID_RESUME"
         );
         assert!(!EngineError::InvalidResume("x".into()).is_transient());
+        // Final review 2026-09-19: a live part is not "invalid resume state".
+        assert_eq!(
+            EngineError::PartInUse("x.mdm.part".into()).code(),
+            "PART_IN_USE"
+        );
+        assert!(!EngineError::PartInUse("x.mdm.part".into()).is_transient());
         assert_eq!(EngineError::Internal("x".into()).code(), "INTERNAL");
         assert!(!EngineError::Internal("x".into()).is_transient());
     }

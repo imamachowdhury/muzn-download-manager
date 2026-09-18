@@ -19,7 +19,15 @@ probe → plan → allocate → fetch (N workers) → complete
   network errors. A single stream (server without range support) restarts from byte 0 on
   every retry — a plain GET always answers from the beginning.
   Writes and fsyncs run on blocking threads.
-- **complete** (`download.rs`): fsync, rename, `name (1).ext` on a clash.
+- **complete** (`download.rs`, `PartFile::finish`): fsync, rename, `name (1).ext` on a clash.
+  An existing file is never overwritten: "pick a free name + rename" runs under one
+  process-wide lock, so two same-name downloads finishing together get two names.
+
+`DownloadSpec::filename` (a caller's name) is sanitised exactly like a probed one
+(`filename::sanitize`): `../x`, `/abs/x` or `C:\x` can never leave `dir`.
+`DownloadSpec::single_stream` downloads a fresh start with one plain GET (one segment,
+`ranged = false`) even when the server advertises ranges — for a server that answers the
+`bytes=0-0` probe with 206 and real ranged requests with 200.
 
 Cookies and `Authorization` are dropped when a redirect leaves the original origin;
 `Range`, `Host` and `Content-Length` from the caller are never sent.
@@ -27,7 +35,9 @@ Cookies and `Authorization` are dropped when a redirect leaves the original orig
 A second live download of the same name gets `name (1).ext`; so does a fresh start whose chosen
 name is in `DownloadSpec::reserved` — the caller's part-file paths of its other, not-yet-running
 downloads, which a fresh start must neither take nor delete. A resume of a part file already
-claimed by another live download is refused (`INVALID_RESUME`) instead, since its name is fixed.
+claimed by another live download is refused (`PART_IN_USE`) instead, since its name is fixed —
+nothing is wrong with the saved state, and that part file belongs to the live download: never
+delete it.
 
 ## Progress, pause, resume
 
@@ -58,14 +68,15 @@ victim notices and stops. This is why the last 10 % does not crawl on one connec
 ## Errors
 
 `EngineError::code()` is stable: `INVALID_URL`, `RANGE_NOT_SUPPORTED`, `SOURCE_CHANGED`,
-`DISK_FULL`, `HTTP_STATUS`, `NETWORK`, `TLS`, `CANCELLED`, `INVALID_RESUME`, `IO`,
-`INTERNAL`.
+`DISK_FULL`, `HTTP_STATUS`, `NETWORK`, `TLS`, `CANCELLED`, `INVALID_RESUME`, `PART_IN_USE`,
+`IO`, `INTERNAL`.
 
 ## Tests
 
 `cargo test -p mdm-engine`. Integration tests run an in-process axum server
 (`tests/support/mod.rs`) with switches: `ranges`, `head_allowed`, `fail_first` (503s),
-`drop_after`, `hang_first`, `hang_headers`, `chunk_delay_ms`, `etag`, `content_disposition`. Every
+`drop_after`, `hang_first`, `hang_headers`, `chunk_delay_ms`, `etag`, `content_disposition`,
+`ranges_only_probe` (only `bytes=0-0` gets a 206; real ranged GETs get 200). Every
 download test ends by comparing SHA-256 of the result with the served bytes.
 
 ## Try it

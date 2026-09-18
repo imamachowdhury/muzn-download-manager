@@ -108,7 +108,8 @@ pub struct DownloadSpec {
     pub url: Url,
     /// Directory for the file.
     pub dir: PathBuf,
-    /// Override the probed name.
+    /// Override the probed name. Sanitised like a probed name
+    /// ([`crate::filename::sanitize`]): it can never leave `dir`.
     pub filename: Option<String>,
     /// Headers and cookies.
     pub extras: RequestExtras,
@@ -118,6 +119,10 @@ pub struct DownloadSpec {
     /// (paused, queued); treated exactly like live parts — a fresh start
     /// picks another name and never deletes them.
     pub reserved: Vec<PathBuf>,
+    /// Download with one plain GET even if the server advertises ranges
+    /// (a fresh start only; a resume is ranged by definition). For a server
+    /// that passes the range probe and then ignores real ranged requests.
+    pub single_stream: bool,
 }
 
 const STOP_NONE: u8 = 0;
@@ -253,14 +258,16 @@ impl Engine {
     /// [`DownloadSpec::reserved`] — gets `name (1).ext`, and a reserved part
     /// file is never deleted; a resume
     /// whose part file is already claimed by another live download is
-    /// refused with [`EngineError::InvalidResume`] instead (its name is
-    /// fixed, so there is nowhere else to put it).
+    /// refused with [`EngineError::PartInUse`] instead (its name is fixed,
+    /// so there is nowhere else to put it, and the file is not its to delete).
     pub async fn start(&self, spec: DownloadSpec) -> Result<DownloadHandle, EngineError> {
         let probe = self.probe(&spec.url, &spec.extras).await?;
-        let base_filename = spec
-            .filename
-            .clone()
-            .unwrap_or_else(|| probe.filename.clone());
+        // A caller's name is sanitised like a probed one: `../x`, `/abs/x` or
+        // `C:\x` joined onto `dir` would otherwise write outside it.
+        let base_filename = match spec.filename.as_deref() {
+            Some(name) => crate::filename::sanitize(name),
+            None => probe.filename.clone(),
+        };
 
         // Claim a live part path exclusively before touching the filesystem:
         // a fresh start whose chosen name is already live is renamed to
@@ -274,9 +281,7 @@ impl Engine {
                 // The caller does not reserve its own part file; a reserved
                 // path equal to it is not a conflict.
                 if live.contains(&part_path) {
-                    return Err(EngineError::InvalidResume(
-                        "the part file is in use by another download".into(),
-                    ));
+                    return Err(EngineError::PartInUse(part_path));
                 }
             } else {
                 let mut n = 1u32;
@@ -323,6 +328,15 @@ impl Engine {
                     true,
                 )
             }
+            // One segment, one plain GET: `ranged = false` also stops `steal()`.
+            None if spec.single_stream => match probe.size {
+                Some(0) => (Vec::new(), false),
+                Some(size) => (
+                    vec![Arc::new(SegmentRuntime::new(0, 0, Some(size - 1), 0))],
+                    false,
+                ),
+                None => (vec![Arc::new(SegmentRuntime::new(0, 0, None, 0))], false),
+            },
             None => match (probe.size, probe.ranges) {
                 (Some(size), true) => (
                     plan_segments(size, self.cfg.max_connections)

@@ -36,6 +36,7 @@ async fn main() {
             extras: RequestExtras::default(),
             resume_from: None,
             reserved: Vec::new(),
+            single_stream: false,
         })
         .await
     {

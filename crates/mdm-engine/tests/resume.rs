@@ -29,6 +29,7 @@ fn spec(s: &TestServer, dir: &std::path::Path, resume: Option<Resume>) -> Downlo
         extras: RequestExtras::default(),
         resume_from: resume,
         reserved: Vec::new(),
+        single_stream: false,
     }
 }
 
@@ -264,6 +265,37 @@ async fn resume_rejects_segments_that_do_not_cover_the_file() {
         .unwrap_err();
     assert_eq!(e.code(), "INVALID_RESUME");
     assert!(!e.is_transient());
+}
+
+#[tokio::test]
+async fn a_resume_of_a_live_part_is_part_in_use_and_the_live_one_completes() {
+    // Final review 2026-09-19: this was INVALID_RESUME, which the manager
+    // answers with "discard the part and start over" — deleting the LIVE
+    // download's part file.
+    let s = TestServer::start(SIZE).await;
+    s.cfg.chunk_delay_ms.store(20, Ordering::SeqCst);
+    let d = tempfile::tempdir().unwrap();
+    let e = engine();
+    let live = e.start(spec(&s, d.path(), None)).await.unwrap();
+    let part = live.part_path().to_owned();
+    let segs = vec![SegmentState {
+        idx: 0,
+        start: 0,
+        end: SIZE as u64 - 1,
+        downloaded: 0,
+    }];
+    let err = e
+        .start(spec(&s, d.path(), Some(resume(&s, segs))))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "PART_IN_USE");
+    assert!(!err.is_transient());
+    assert!(part.exists());
+    s.cfg.chunk_delay_ms.store(0, Ordering::SeqCst);
+    let Outcome::Completed(path) = live.wait().await else {
+        panic!("the live download still completes")
+    };
+    assert_eq!(sha256_file(&path), sha256_bytes(&s.data));
 }
 
 #[tokio::test]

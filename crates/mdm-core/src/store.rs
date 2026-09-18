@@ -81,6 +81,10 @@ impl Store {
     }
 
     fn init(conn: Connection) -> Result<Store> {
+        // Wait (up to 5 s) for another connection's write instead of failing
+        // at once with SQLITE_BUSY. rusqlite happens to default to this too;
+        // it is set here so it never depends on that default.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version > SCHEMA_VERSION {
@@ -435,4 +439,22 @@ fn decode(raw: Raw) -> Result<DownloadRow> {
         updated_at,
         completed_at,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_busy_database_is_waited_for_not_refused() {
+        // Final review 2026-09-19: without a busy timeout a second connection
+        // (a second launch, the crash test's reopen) got SQLITE_BUSY at once.
+        let d = tempfile::tempdir().unwrap();
+        let store = Store::open(&d.path().join("mdm.db")).unwrap();
+        let ms: i64 = store
+            .conn()
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ms, 5000);
+    }
 }
