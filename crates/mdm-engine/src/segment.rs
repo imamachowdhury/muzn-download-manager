@@ -32,6 +32,7 @@ pub struct SegmentRuntime {
     /// First byte.
     pub start: u64,
     /// Last byte, inclusive; [`UNKNOWN_END`] for a single stream. A stealer may lower it.
+    /// A stealer must never lower it below `next_offset()`.
     pub end: AtomicU64,
     /// Bytes written so far, from `start`.
     pub downloaded: AtomicU64,
@@ -60,7 +61,7 @@ impl SegmentRuntime {
         } else {
             end
         };
-        let downloaded = downloaded.min(end + 1 - self.start);
+        let downloaded = downloaded.min((end + 1).saturating_sub(self.start));
         SegmentState {
             idx: self.idx,
             start: self.start,
@@ -106,7 +107,8 @@ pub struct SegmentJob {
 }
 
 /// Fetch the segment to completion, or fail with a permanent error, or
-/// [`EngineError::Cancelled`].
+/// [`EngineError::Cancelled`]. A single stream (`ranged == false`) always
+/// answers from byte 0, so every attempt restarts it from the beginning.
 pub async fn fetch_segment(job: SegmentJob) -> Result<(), EngineError> {
     let mut attempt: u32 = 0;
     loop {
@@ -134,9 +136,17 @@ pub async fn fetch_segment(job: SegmentJob) -> Result<(), EngineError> {
 
 async fn attempt_once(job: &SegmentJob) -> Result<(), EngineError> {
     let seg = &job.seg;
-    let next = seg.next_offset();
+    let next = if job.ranged {
+        seg.next_offset()
+    } else {
+        // A plain GET always answers from byte 0: a retry re-fetches the
+        // whole stream, so any partial progress from a dropped attempt is
+        // discarded rather than resumed at the wrong file offset.
+        seg.downloaded.store(0, Ordering::SeqCst);
+        seg.start
+    };
     let end = seg.end.load(Ordering::SeqCst);
-    if end != UNKNOWN_END && next > end {
+    if job.ranged && end != UNKNOWN_END && next > end {
         return Ok(());
     }
     let mut rb = job.extras.apply(job.client.get(job.url.clone()));

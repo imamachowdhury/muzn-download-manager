@@ -161,7 +161,14 @@ async fn cancel_stops_and_keeps_progress() {
     let (j, _) = job(&s, d.path(), seg.clone(), true);
     let cancel = j.cancel.clone();
     let task = tokio::spawn(fetch_segment(j));
-    tokio::time::sleep(Duration::from_millis(100)).await; // 1 000 bytes in, then hanging
+    // Poll instead of a fixed sleep: on a cold CI runner the first 1 000
+    // bytes may not have landed yet after a flat 100 ms.
+    for _ in 0..500 {
+        if seg.downloaded.load(Ordering::SeqCst) == 1000 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     cancel.cancel();
     let e = task.await.unwrap().unwrap_err();
     assert_eq!(e.code(), "CANCELLED");
@@ -182,4 +189,20 @@ async fn shrinking_end_stops_the_worker_early() {
     assert!(seg.is_done());
     let bytes = std::fs::read(file.part_path()).unwrap();
     assert_eq!(&bytes[..2000], &s.data[..2000]);
+}
+
+#[tokio::test]
+async fn single_stream_retry_restarts_from_the_beginning() {
+    // Review finding 2026-09-18: a retried plain GET starts at byte 0, so the
+    // worker must write from `start` again, never at start + downloaded.
+    let s = TestServer::start(100_000).await;
+    s.cfg.ranges.store(false, Ordering::SeqCst);
+    s.cfg.hang_first.store(1, Ordering::SeqCst); // first body: 1 000 bytes then stall
+    let d = tempfile::tempdir().unwrap();
+    let seg = Arc::new(SegmentRuntime::new(0, 0, None, 0));
+    let (j, file) = job(&s, d.path(), seg.clone(), false);
+    fetch_segment(j).await.unwrap();
+    assert_eq!(s.cfg.requests.load(Ordering::SeqCst), 2);
+    assert_eq!(seg.end.load(Ordering::SeqCst), 99_999);
+    assert_eq!(sha256_file(file.part_path()), sha256_bytes(&s.data));
 }
