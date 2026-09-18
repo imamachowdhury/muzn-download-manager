@@ -24,6 +24,9 @@ use crate::segment::{fetch_segment, SegmentJob, SegmentRuntime};
 pub const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 /// A finished worker steals from a segment only if this much is left.
 pub const STEAL_MIN_REMAINING: u64 = 2 * 1024 * 1024;
+/// How often the part file is fsynced while downloading; see
+/// [`Progress::durable_segments`].
+pub const SYNC_INTERVAL: Duration = Duration::from_secs(1);
 const SPEED_WINDOW: Duration = Duration::from_secs(2);
 
 /// Where a download is.
@@ -54,6 +57,13 @@ pub struct Progress {
     pub eta_secs: Option<u64>,
     /// Every segment, including stolen ones.
     pub segments: Vec<SegmentState>,
+    /// The segments as of the last completed fsync of the part file (taken
+    /// just before it): only these bytes are known to survive a power cut.
+    /// At start it is the starting state (resume segments, or all-zero fresh
+    /// segments). On `Paused` / `Failed` the run syncs once more, so the final
+    /// value equals the outcome's segments. Callers persist this, never
+    /// `segments`, which may count bytes still in the OS cache.
+    pub durable_segments: Vec<SegmentState>,
     /// Current status.
     pub status: Status,
 }
@@ -289,6 +299,13 @@ impl Engine {
         if spec.resume_from.is_none() && part_path.exists() {
             std::fs::remove_file(&part_path).map_err(EngineError::from_io)?;
         }
+        // The starting state is durable by definition: a resume's segments
+        // were saved from a durable snapshot, fresh segments claim nothing.
+        let durable: Vec<SegmentState> = {
+            let mut v: Vec<SegmentState> = segments.iter().map(|s| s.snapshot()).collect();
+            v.sort_by_key(|s| s.idx);
+            v
+        };
         let file = Arc::new(PartFile::open(&spec.dir, &filename, probe.size)?);
         let run = Run {
             engine: self.clone(),
@@ -296,6 +313,7 @@ impl Engine {
             extras: spec.extras.clone(),
             file,
             segments: Mutex::new(segments),
+            durable: Mutex::new(durable),
             ranged,
             total: probe.size,
             cancel: CancellationToken::new(),
@@ -382,6 +400,8 @@ struct Run {
     extras: RequestExtras,
     file: Arc<PartFile>,
     segments: Mutex<Vec<Arc<SegmentRuntime>>>,
+    /// The snapshot taken just before the last completed fsync.
+    durable: Mutex<Vec<SegmentState>>,
     ranged: bool,
     total: Option<u64>,
     cancel: CancellationToken,
@@ -429,7 +449,18 @@ impl Run {
             speed_bps,
             eta_secs,
             segments,
+            durable_segments: self.durable.lock().unwrap().clone(),
             status,
+        }
+    }
+
+    /// fsync the part file off the async threads, then record `snap` as durable.
+    async fn sync_to(&self, snap: Vec<SegmentState>) {
+        let file = self.file.clone();
+        match tokio::task::spawn_blocking(move || file.sync()).await {
+            Ok(Ok(())) => *self.durable.lock().unwrap() = snap,
+            Ok(Err(e)) => tracing::warn!(error = %e, "sync of the part file failed"),
+            Err(e) => tracing::warn!(error = %e, "sync task failed"),
         }
     }
 
@@ -468,12 +499,22 @@ impl Run {
         let mut ticker = tokio::time::interval(PROGRESS_INTERVAL);
         let mut meter = SpeedMeter::default();
         let mut failure: Option<EngineError> = None;
+        let mut last_sync = Instant::now();
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
                     let p = self.progress(0, Status::Downloading);
                     let speed = meter.push(p.downloaded);
                     tx.send_replace(Progress { speed_bps: speed, ..p });
+                    if last_sync.elapsed() >= SYNC_INTERVAL {
+                        // The snapshot is taken BEFORE the fsync: every byte
+                        // it counts was written before it, so the sync covers
+                        // it. The `Arc<PartFile>` clone lives only inside
+                        // `sync_to`, so `Arc::try_unwrap` below still works.
+                        let snap = self.snapshot();
+                        self.sync_to(snap).await;
+                        last_sync = Instant::now();
+                    }
                 }
                 res = set.join_next() => match res {
                     None => break,
@@ -501,6 +542,15 @@ impl Run {
             }
         }
 
+        // Every worker has ended, so the segments no longer move. A run that
+        // is not heading for completion syncs once more, so a Paused / Failed
+        // outcome is durable; this happens while `self` is still whole.
+        let stop = self.stop.load(Ordering::SeqCst);
+        let all_done = self.snapshot().iter().all(|s| s.is_done());
+        if failure.is_some() || stop != STOP_NONE || !all_done {
+            self.sync_to(self.snapshot()).await;
+        }
+
         // Everything the final `Progress` needs is read from `self` HERE, while
         // `self` is still whole: taking the part file out below is a partial
         // move, after which no `&self` method may be called. `Run` must stay
@@ -508,8 +558,7 @@ impl Run {
         let segments = self.snapshot();
         let downloaded: u64 = segments.iter().map(|s| s.downloaded).sum();
         let total = self.total;
-        let stop = self.stop.load(Ordering::SeqCst);
-        let all_done = segments.iter().all(|s| s.is_done());
+        let durable = self.durable.lock().unwrap().clone();
         let file = self.file;
 
         let outcome = if let Some(error) = failure {
@@ -547,6 +596,11 @@ impl Run {
             Outcome::Failed { .. } => Status::Failed,
             Outcome::Cancelled => Status::Cancelled,
         };
+        // `finish()` fsyncs before the rename: a completed file is durable whole.
+        let durable_segments = match &outcome {
+            Outcome::Completed(_) => segments.clone(),
+            _ => durable,
+        };
         tx.send_replace(Progress {
             total,
             downloaded,
@@ -558,6 +612,7 @@ impl Run {
                 _ => None,
             },
             segments,
+            durable_segments,
             status,
         });
         outcome

@@ -248,9 +248,18 @@ async fn attempt_once(job: &SegmentJob, wrote: &mut u64) -> Result<(), EngineErr
         if buf.is_empty() {
             break; // the range was shrunk under us; what we have is enough
         }
-        job.file.write_at(pos, buf).map_err(EngineError::from_io)?;
-        pos += buf.len() as u64;
-        *wrote += buf.len() as u64;
+        // Disk I/O leaves the async threads: hand an owned prefix of the
+        // chunk (`buf` is always `&chunk[..len]`) to a blocking thread.
+        let len = buf.len();
+        let data = chunk.slice(..len);
+        let file = job.file.clone();
+        tokio::task::spawn_blocking(move || file.write_at(pos, &data))
+            .await
+            .map_err(|e| EngineError::Internal(format!("write task: {e}")))?
+            .map_err(EngineError::from_io)?;
+        // Only a write that returned Ok counts toward the retry rule.
+        pos += len as u64;
+        *wrote += len as u64;
         seg.downloaded.store(pos - seg.start, Ordering::SeqCst);
         if end != UNKNOWN_END && pos > end {
             break;

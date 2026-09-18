@@ -346,3 +346,18 @@ async fn a_pause_that_arrives_after_the_last_byte_still_completes() {
     };
     assert_eq!(sha256_file(&path), sha256_bytes(&s.data));
 }
+
+#[tokio::test]
+async fn a_paused_outcome_is_durable() {
+    let s = TestServer::start(SIZE).await;
+    let d = tempfile::tempdir().unwrap();
+    s.cfg.hang_first.store(4, Ordering::SeqCst);
+    let h = engine().start(spec(&s, d.path(), None)).await.unwrap();
+    let rx = h.subscribe();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    h.pause();
+    let Outcome::Paused(segs) = h.wait().await else {
+        panic!()
+    };
+    assert_eq!(rx.borrow().durable_segments, segs);
+}

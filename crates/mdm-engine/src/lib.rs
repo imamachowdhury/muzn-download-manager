@@ -20,7 +20,7 @@ pub mod request;
 pub mod segment;
 pub use download::{
     DownloadControl, DownloadHandle, DownloadSpec, Outcome, Progress, Resume, Status,
-    PROGRESS_INTERVAL, STEAL_MIN_REMAINING,
+    PROGRESS_INTERVAL, STEAL_MIN_REMAINING, SYNC_INTERVAL,
 };
 pub use engine::{Engine, EngineConfig, Proxy};
 pub use error::EngineError;

@@ -177,8 +177,14 @@ async fn permanent_mid_download_failure_reports_and_keeps_part() {
 }
 
 #[tokio::test]
-async fn progress_stream_reports_bytes_and_speed() {
-    let s = TestServer::start(8 * 1024 * 1024).await;
+async fn progress_reports_speed_and_a_durable_snapshot_while_downloading() {
+    // Final review 2026-09-18: the saved state must only claim bytes that
+    // reached the disk (a power cut loses the page cache).
+    let s = TestServer::start(6 * 1024 * 1024).await;
+    // 1.5 MiB per worker = 24 chunks of 64 KiB; 100 ms each keeps the download
+    // running ~2.4 s, past the first SYNC_INTERVAL (1 s) and several ticks.
+    // (2 ms finished in ~0.3 s: before any sync, sometimes before a speed.)
+    s.cfg.chunk_delay_ms.store(100, Ordering::SeqCst);
     let d = tempfile::tempdir().unwrap();
     let h = engine(4)
         .start(spec(&s.file_url(), d.path()))
@@ -187,12 +193,39 @@ async fn progress_stream_reports_bytes_and_speed() {
     let mut rx = h.subscribe();
     let first = rx.borrow_and_update().clone();
     assert_eq!(first.status, Status::Downloading);
-    assert_eq!(first.total, Some(8 * 1024 * 1024));
-    let _ = h.wait().await;
-    let last = rx.borrow().clone();
-    assert_eq!(last.status, Status::Completed);
-    assert_eq!(last.downloaded, 8 * 1024 * 1024);
-    assert_eq!(last.eta_secs, Some(0));
+    assert_eq!(
+        first
+            .durable_segments
+            .iter()
+            .map(|x| x.downloaded)
+            .sum::<u64>(),
+        0
+    );
+    let mut saw_speed = false;
+    let mut saw_durable = false;
+    while rx.changed().await.is_ok() {
+        let p = rx.borrow_and_update().clone();
+        if p.status != Status::Downloading {
+            break;
+        }
+        saw_speed |= p.speed_bps > 0;
+        let durable: u64 = p.durable_segments.iter().map(|x| x.downloaded).sum();
+        assert!(
+            durable <= p.downloaded,
+            "durable {durable} > downloaded {}",
+            p.downloaded
+        );
+        saw_durable |= durable > 0;
+    }
+    assert!(saw_speed, "a speed above zero was reported");
+    assert!(
+        saw_durable,
+        "a durable snapshot was published during the download"
+    );
+    let Outcome::Completed(path) = h.wait().await else {
+        panic!()
+    };
+    assert_eq!(sha256_file(&path), sha256_bytes(&s.data));
 }
 
 #[tokio::test]

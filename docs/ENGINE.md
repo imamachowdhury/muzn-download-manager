@@ -16,6 +16,7 @@ probe → plan → allocate → fetch (N workers) → complete
   probe's HEAD and GET wait at most as long. 4xx except 429 = fail at once; 429 and 5xx back off like
   network errors. A single stream (server without range support) restarts from byte 0 on
   every retry — a plain GET always answers from the beginning.
+  Writes and fsyncs run on blocking threads.
 - **complete** (`download.rs`): fsync, rename, `name (1).ext` on a clash.
 
 The caller keeps (dir, filename) unique among live downloads; two live downloads of the
@@ -27,6 +28,8 @@ same name share one part file.
 `Progress` (250 ms cadence, 2 s speed window). `pause()` ends the task with
 `Outcome::Paused(segments)`; the caller stores them and later calls `start` again with
 `resume_from: Resume { segments, size, etag, last_modified }`. A crash is the same path.
+Persist `durable_segments` — the segments as of the last fsync (every second, and once
+more at a pause or failure). `segments` may count bytes still in the OS cache.
 Dropping a `DownloadHandle` without `wait()` pauses its download (the task stops, the
 part file stays) — it never keeps running unowned.
 `handle.control()` gives a cloneable pause / cancel for use while another task awaits
