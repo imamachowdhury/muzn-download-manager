@@ -6,11 +6,15 @@
 #![warn(missing_docs)]
 
 pub mod error;
+pub mod events;
+pub mod manager;
 pub mod model;
 pub mod settings;
 pub mod store;
 
 pub use error::{CoreError, Result};
+pub use events::{ManagerEvent, SegmentView};
+pub use manager::{Manager, PERSIST_INTERVAL};
 pub use model::*;
 pub use settings::{ProxySetting, Settings};
 pub use store::Store;

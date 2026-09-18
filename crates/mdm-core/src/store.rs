@@ -220,6 +220,15 @@ impl Store {
         found(n, id)
     }
 
+    /// Record the size learned at completion (a stream of unknown length).
+    pub fn set_size(&self, id: &DownloadId, size: u64, now: i64) -> Result<()> {
+        let n = self.conn.lock().unwrap().execute(
+            "UPDATE downloads SET size = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id.as_str(), size as i64, now],
+        )?;
+        found(n, id)
+    }
+
     /// At startup: rows that were probing or downloading when the app stopped go back to the queue.
     pub fn reset_interrupted(&self, now: i64) -> Result<usize> {
         Ok(self.conn.lock().unwrap().execute(
