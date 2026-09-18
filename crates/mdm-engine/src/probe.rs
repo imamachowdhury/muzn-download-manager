@@ -7,6 +7,7 @@ use reqwest::header::{
     ETAG, LAST_MODIFIED, RANGE,
 };
 use reqwest::{Response, StatusCode};
+use tokio::time::timeout;
 use url::Url;
 
 use crate::engine::Engine;
@@ -34,7 +35,8 @@ pub struct Probe {
 }
 
 impl Engine {
-    /// Probe a URL. Follows redirects, never downloads more than one byte.
+    /// Probe a URL. Follows redirects, never downloads more than one byte, and
+    /// waits at most `stall_timeout` for each response's headers.
     pub async fn probe(&self, url: &Url, extras: &RequestExtras) -> Result<Probe, EngineError> {
         if !matches!(url.scheme(), "http" | "https") {
             return Err(EngineError::InvalidUrl(format!(
@@ -42,7 +44,11 @@ impl Engine {
                 url.scheme()
             )));
         }
-        if let Ok(r) = extras.apply(self.client.head(url.clone())).send().await {
+        // Both requests wait at most `stall_timeout` for the response headers:
+        // a silent HEAD falls through to the GET, a silent GET is a network error.
+        let wait = self.cfg.stall_timeout;
+        let head = extras.apply(self.client.head(url.clone())).send();
+        if let Ok(Ok(r)) = timeout(wait, head).await {
             if r.status().is_success() {
                 if let Some(size) = header_u64(&r, CONTENT_LENGTH) {
                     let ranges = accepts_ranges(&r);
@@ -50,11 +56,13 @@ impl Engine {
                 }
             }
         }
-        let r = extras
+        let get = extras
             .apply(self.client.get(url.clone()))
             .header(RANGE, "bytes=0-0")
-            .send()
-            .await?;
+            .send();
+        let r = timeout(wait, get).await.map_err(|_| {
+            EngineError::Network("no response headers within stall_timeout".into())
+        })??;
         let status = r.status();
         if !status.is_success() {
             return Err(EngineError::HttpStatus {

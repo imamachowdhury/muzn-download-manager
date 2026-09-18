@@ -108,7 +108,31 @@ const STOP_NONE: u8 = 0;
 const STOP_PAUSE: u8 = 1;
 const STOP_CANCEL: u8 = 2;
 
+/// Dropping a [`DownloadHandle`] pauses its download: the stop code is set to
+/// PAUSE *before* the token is cancelled, exactly like `pause()`, so the task
+/// ends with its part file intact and resumable instead of running on as an
+/// orphan. `wait()` disarms it once the task has ended.
+#[derive(Debug)]
+struct StopOnDrop {
+    stop: Arc<AtomicU8>,
+    cancel: CancellationToken,
+    armed: bool,
+}
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.stop.store(STOP_PAUSE, Ordering::SeqCst);
+            self.cancel.cancel();
+        }
+    }
+}
+
 /// A running download.
+///
+/// Dropping the handle without `wait()`ing pauses the download (the task
+/// stops and keeps the part file for a resume); it never leaves the task
+/// running unowned.
 #[derive(Debug)]
 pub struct DownloadHandle {
     probe: Probe,
@@ -117,6 +141,9 @@ pub struct DownloadHandle {
     cancel: CancellationToken,
     stop: Arc<AtomicU8>,
     join: JoinHandle<Outcome>,
+    // `DownloadHandle` itself must stay free of a `Drop` impl: `wait()` moves
+    // `join` out of `self`. The drop behaviour lives in this field instead.
+    guard: StopOnDrop,
 }
 
 impl DownloadHandle {
@@ -142,12 +169,15 @@ impl DownloadHandle {
         self.stop.store(STOP_CANCEL, Ordering::SeqCst);
         self.cancel.cancel();
     }
-    /// Wait for the end.
-    pub async fn wait(self) -> Outcome {
-        self.join.await.unwrap_or_else(|_| Outcome::Failed {
+    /// Wait for the end. Dropping this future before it resolves pauses the
+    /// download, like dropping the handle.
+    pub async fn wait(mut self) -> Outcome {
+        let outcome = (&mut self.join).await.unwrap_or_else(|_| Outcome::Failed {
             error: EngineError::Network("download task panicked".into()),
             segments: Vec::new(),
-        })
+        });
+        self.guard.armed = false;
+        outcome
     }
 }
 
@@ -155,7 +185,12 @@ impl Engine {
     /// Probe, then start downloading. Errors here mean nothing was started.
     ///
     /// A fresh start discards any leftover `.mdm.part` of the same name; only a
-    /// resume reuses it.
+    /// resume reuses it. A resume whose segments do not cover the file, or
+    /// whose part file has the wrong length, is refused with
+    /// [`EngineError::InvalidResume`].
+    ///
+    /// The caller keeps (dir, filename) unique among live downloads; two live
+    /// downloads of the same name share one part file.
     pub async fn start(&self, spec: DownloadSpec) -> Result<DownloadHandle, EngineError> {
         let probe = self.probe(&spec.url, &spec.extras).await?;
         let filename = spec
@@ -184,6 +219,7 @@ impl Engine {
                         "part file missing; start over",
                     )));
                 }
+                validate_resume(r, &part_path)?;
                 (
                     r.segments
                         .iter()
@@ -232,6 +268,11 @@ impl Engine {
         let cancel = run.cancel.clone();
         let stop = run.stop.clone();
         let join = tokio::spawn(run.run(tx));
+        let guard = StopOnDrop {
+            stop: stop.clone(),
+            cancel: cancel.clone(),
+            armed: true,
+        };
         Ok(DownloadHandle {
             probe,
             part_path,
@@ -239,8 +280,63 @@ impl Engine {
             cancel,
             stop,
             join,
+            guard,
         })
     }
+}
+
+/// Check that saved resume state describes a `r.size`-byte file: segments that
+/// run contiguously from byte 0 to `size - 1` (none for an empty file), no
+/// segment claiming more bytes than its range, and a part file of exactly
+/// `size` bytes. Anything else would "complete" a file with holes.
+fn validate_resume(r: &Resume, part_path: &Path) -> Result<(), EngineError> {
+    let bad = |why: String| Err(EngineError::InvalidResume(why));
+    let mut segs: Vec<&SegmentState> = r.segments.iter().collect();
+    segs.sort_by_key(|s| s.start);
+    if r.size == 0 {
+        if !segs.is_empty() {
+            return bad("segments given for an empty file".into());
+        }
+    } else {
+        if segs.is_empty() {
+            return bad("no segments".into());
+        }
+        let mut expect = 0u64;
+        for s in &segs {
+            if s.start != expect {
+                return bad(format!(
+                    "segment {} starts at {}, expected {expect}",
+                    s.idx, s.start
+                ));
+            }
+            if s.end < s.start {
+                return bad(format!("segment {} ends before it starts", s.idx));
+            }
+            if s.downloaded > s.end - s.start + 1 {
+                return bad(format!(
+                    "segment {} claims {} bytes of a {}-byte range",
+                    s.idx,
+                    s.downloaded,
+                    s.end - s.start + 1
+                ));
+            }
+            expect = s.end + 1;
+        }
+        if expect != r.size {
+            return bad(format!(
+                "segments end at byte {}, the file has {} bytes",
+                expect.saturating_sub(1),
+                r.size
+            ));
+        }
+    }
+    let len = std::fs::metadata(part_path)
+        .map_err(EngineError::from_io)?
+        .len();
+    if len != r.size {
+        return bad(format!("part file is {len} bytes, the file has {}", r.size));
+    }
+    Ok(())
 }
 
 struct Run {

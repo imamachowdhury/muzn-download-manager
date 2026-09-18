@@ -29,6 +29,9 @@ pub struct ServerCfg {
     /// Stream bodies in 64 KiB chunks with this pause between them, so a test
     /// can watch a download in flight.
     pub chunk_delay_ms: AtomicU64,
+    /// The first N GET or HEAD requests to `/file` never answer: no status,
+    /// no headers. A GET is still counted in `requests`.
+    pub hang_headers: AtomicU32,
 }
 
 impl Default for ServerCfg {
@@ -43,6 +46,7 @@ impl Default for ServerCfg {
             requests: AtomicU32::new(0),
             content_disposition: Mutex::new(None),
             chunk_delay_ms: AtomicU64::new(0),
+            hang_headers: AtomicU32::new(0),
         }
     }
 }
@@ -99,6 +103,15 @@ async fn file(State(s): State<AppState>, method: Method, headers: HeaderMap) -> 
     }
     if method == Method::GET {
         cfg.requests.fetch_add(1, Ordering::SeqCst);
+    }
+    let silent = cfg
+        .hang_headers
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        .is_ok();
+    if silent {
+        std::future::pending::<()>().await;
+    }
+    if method == Method::GET {
         // fetch_update: decrement while > 0, and only then answer 503.
         let failed = cfg
             .fail_first

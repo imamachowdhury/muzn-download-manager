@@ -12,10 +12,14 @@ probe → plan → allocate → fetch (N workers) → complete
 - **allocate** (`file.rs`): `<name>.mdm.part`, pre-sized. Positioned writes; no merge step.
 - **fetch** (`segment.rs`): one worker per segment. `Range: bytes=<next>-<end>`, expects 206
   with a matching `Content-Range`. Transient errors back off 1, 2, 4 … 60 s, ten attempts.
-  30 s without bytes = reconnect. 4xx except 429 = fail at once; 429 and 5xx back off like
+  30 s (`stall_timeout`) without bytes, or without response headers, = reconnect; the
+  probe's HEAD and GET wait at most as long. 4xx except 429 = fail at once; 429 and 5xx back off like
   network errors. A single stream (server without range support) restarts from byte 0 on
   every retry — a plain GET always answers from the beginning.
 - **complete** (`download.rs`): fsync, rename, `name (1).ext` on a clash.
+
+The caller keeps (dir, filename) unique among live downloads; two live downloads of the
+same name share one part file.
 
 ## Progress, pause, resume
 
@@ -23,10 +27,14 @@ probe → plan → allocate → fetch (N workers) → complete
 `Progress` (250 ms cadence, 2 s speed window). `pause()` ends the task with
 `Outcome::Paused(segments)`; the caller stores them and later calls `start` again with
 `resume_from: Resume { segments, size, etag, last_modified }`. A crash is the same path.
+Dropping a `DownloadHandle` without `wait()` pauses its download (the task stops, the
+part file stays) — it never keeps running unowned.
 Before resuming the engine re-probes: a changed ETag / Last-Modified / size is
 `SOURCE_CHANGED`; a server that stopped honouring ranges is `RANGE_NOT_SUPPORTED`; a
-missing `.mdm.part` is `IO`. All three mean "start over" to the caller. A fresh start
-discards any leftover `.mdm.part` of the same name; only a resume reuses it.
+missing `.mdm.part` is `IO`; segments that do not run contiguously over `[0, size)`, or a
+part file whose length is not `size`, are `INVALID_RESUME`. All four mean "start over" to
+the caller. A fresh start discards any leftover `.mdm.part` of the same name; only a
+resume reuses it.
 
 ## Work stealing
 
@@ -37,13 +45,13 @@ victim notices and stops. This is why the last 10 % does not crawl on one connec
 ## Errors
 
 `EngineError::code()` is stable: `INVALID_URL`, `RANGE_NOT_SUPPORTED`, `SOURCE_CHANGED`,
-`DISK_FULL`, `HTTP_STATUS`, `NETWORK`, `TLS`, `CANCELLED`, `IO`.
+`DISK_FULL`, `HTTP_STATUS`, `NETWORK`, `TLS`, `CANCELLED`, `INVALID_RESUME`, `IO`.
 
 ## Tests
 
 `cargo test -p mdm-engine`. Integration tests run an in-process axum server
 (`tests/support/mod.rs`) with switches: `ranges`, `head_allowed`, `fail_first` (503s),
-`drop_after`, `hang_first`, `chunk_delay_ms`, `etag`, `content_disposition`. Every
+`drop_after`, `hang_first`, `hang_headers`, `chunk_delay_ms`, `etag`, `content_disposition`. Every
 download test ends by comparing SHA-256 of the result with the served bytes.
 
 ## Try it

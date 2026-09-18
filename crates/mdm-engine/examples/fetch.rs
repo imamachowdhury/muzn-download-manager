@@ -7,9 +7,18 @@ use mdm_engine::{DownloadSpec, Engine, EngineConfig, Outcome, RequestExtras};
 #[tokio::main]
 async fn main() {
     let mut args = std::env::args().skip(1);
+    const USAGE: &str = "usage: fetch <url> [dir] [connections]";
     let Some(url) = args.next() else {
-        eprintln!("usage: fetch <url> [dir] [connections]");
+        eprintln!("{USAGE}");
         std::process::exit(2);
+    };
+    let url: url::Url = match url.parse() {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("invalid URL: {e}");
+            eprintln!("{USAGE}");
+            std::process::exit(2);
+        }
     };
     let dir = PathBuf::from(args.next().unwrap_or_else(|| ".".into()));
     let conns: u8 = args.next().and_then(|c| c.parse().ok()).unwrap_or(8);
@@ -21,7 +30,7 @@ async fn main() {
     .unwrap();
     let handle = match engine
         .start(DownloadSpec {
-            url: url.parse().expect("a valid http(s) URL"),
+            url,
             dir,
             filename: None,
             extras: RequestExtras::default(),
@@ -68,6 +77,7 @@ async fn main() {
                 bars,
                 pr.status
             );
+            let _ = std::io::Write::flush(&mut std::io::stdout());
         }
     });
     let out = handle.wait().await;

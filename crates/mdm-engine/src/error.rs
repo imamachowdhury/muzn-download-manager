@@ -30,6 +30,10 @@ pub enum EngineError {
     /// The caller cancelled.
     #[error("cancelled")]
     Cancelled,
+    /// The saved state does not describe this file (segments that do not
+    /// cover it, or a part file of the wrong length); start over.
+    #[error("invalid resume state: {0}")]
+    InvalidResume(String),
     /// Any other I/O failure.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -76,6 +80,7 @@ impl EngineError {
             Self::Network(_) => "NETWORK",
             Self::Tls(_) => "TLS",
             Self::Cancelled => "CANCELLED",
+            Self::InvalidResume(_) => "INVALID_RESUME",
             Self::Io(_) => "IO",
         }
     }
@@ -136,6 +141,14 @@ mod tests {
         );
         assert_eq!(EngineError::Network("x".into()).code(), "NETWORK");
         assert_eq!(EngineError::Cancelled.code(), "CANCELLED");
+        assert_eq!(EngineError::InvalidUrl("x".into()).code(), "INVALID_URL");
+        assert_eq!(EngineError::Io(std::io::Error::other("x")).code(), "IO");
+        assert_eq!(EngineError::Tls("x".into()).code(), "TLS");
+        assert_eq!(
+            EngineError::InvalidResume("x".into()).code(),
+            "INVALID_RESUME"
+        );
+        assert!(!EngineError::InvalidResume("x".into()).is_transient());
     }
 
     #[test]

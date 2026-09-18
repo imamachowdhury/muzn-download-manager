@@ -1,6 +1,7 @@
 mod support;
 
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use mdm_engine::{Engine, EngineConfig, EngineError, RequestExtras};
 use support::*;
@@ -118,6 +119,29 @@ async fn rejects_non_http_scheme() {
         .await
         .unwrap_err();
     assert_eq!(e.code(), "INVALID_URL");
+}
+
+#[tokio::test]
+async fn probe_does_not_hang_on_a_silent_server() {
+    // Final review 2026-09-18: neither the HEAD nor the GET fallback had a
+    // timeout for the response headers.
+    let s = TestServer::start(10).await;
+    s.cfg.hang_headers.store(100, Ordering::SeqCst);
+    let e = Engine::new(EngineConfig {
+        stall_timeout: Duration::from_millis(300),
+        ..Default::default()
+    })
+    .unwrap();
+    let r = tokio::time::timeout(
+        Duration::from_secs(3),
+        e.probe(
+            &Url::parse(&s.file_url()).unwrap(),
+            &RequestExtras::default(),
+        ),
+    )
+    .await
+    .expect("the probe must give up within 3 s");
+    assert_eq!(r.unwrap_err().code(), "NETWORK");
 }
 
 #[tokio::test]

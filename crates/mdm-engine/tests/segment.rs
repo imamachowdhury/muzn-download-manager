@@ -153,6 +153,23 @@ async fn stall_reconnects() {
 }
 
 #[tokio::test]
+async fn header_stall_reconnects() {
+    // Final review 2026-09-18: `stall_timeout` only guarded the body, so a
+    // server that accepted and never answered hung the segment forever.
+    let s = TestServer::start(100_000).await;
+    s.cfg.hang_headers.store(1, Ordering::SeqCst); // first request: no headers, ever
+    let d = tempfile::tempdir().unwrap();
+    let seg = Arc::new(SegmentRuntime::new(0, 0, Some(99_999), 0));
+    let (j, file) = job(&s, d.path(), seg, true);
+    tokio::time::timeout(Duration::from_secs(10), fetch_segment(j))
+        .await
+        .expect("a silent server must time out, not hang the worker")
+        .unwrap();
+    assert_eq!(sha256_file(file.part_path()), sha256_bytes(&s.data));
+    assert_eq!(s.cfg.requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn cancel_stops_and_keeps_progress() {
     let s = TestServer::start(2_000_000).await;
     s.cfg.hang_first.store(1, Ordering::SeqCst);

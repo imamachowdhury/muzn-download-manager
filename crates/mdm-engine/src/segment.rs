@@ -153,9 +153,18 @@ async fn attempt_once(job: &SegmentJob) -> Result<(), EngineError> {
     if job.ranged {
         rb = rb.header(RANGE, format!("bytes={next}-{end}"));
     }
+    // `stall_timeout` also bounds the wait for the response headers: a server
+    // that accepts the connection and never answers is a stall like any other.
     let resp = tokio::select! {
         _ = job.cancel.cancelled() => return Err(EngineError::Cancelled),
-        r = rb.send() => r?,
+        r = tokio::time::timeout(job.stall_timeout, rb.send()) => match r {
+            Err(_) => {
+                return Err(EngineError::Network(
+                    "no response headers within stall_timeout".into(),
+                ))
+            }
+            Ok(r) => r?,
+        },
     };
     let status = resp.status();
     if job.ranged {
