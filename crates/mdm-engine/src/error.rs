@@ -40,6 +40,30 @@ pub(crate) const ENOSPC_CODE: i32 = 112; // ERROR_DISK_FULL
 #[cfg(not(windows))]
 pub(crate) const ENOSPC_CODE: i32 = 28; // ENOSPC
 
+/// Walk an error's `source()` chain, deepest cause last.
+fn source_messages(e: &(dyn std::error::Error + 'static)) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = e.source();
+    while let Some(s) = cur {
+        out.push(s.to_string());
+        cur = s.source();
+    }
+    out
+}
+
+/// True when any cause in the chain is a TLS failure. The top-level text is
+/// deliberately NOT inspected: it carries the URL, and a host named
+/// "tls.example.com" must not turn a network blip into a permanent error.
+fn is_tls_chain(sources: &[String]) -> bool {
+    sources.iter().any(|m| {
+        let l = m.to_ascii_lowercase();
+        l.contains("certificate")
+            || l.contains("tls")
+            || l.contains("handshake")
+            || l.contains("alert")
+    })
+}
+
 impl EngineError {
     /// Stable identifier for UI mapping and logs.
     pub fn code(&self) -> &'static str {
@@ -85,9 +109,12 @@ impl From<reqwest::Error> for EngineError {
                 status: status.as_u16(),
             };
         }
-        let text = e.to_string();
-        // reqwest exposes no is_tls(); rustls errors carry these words.
-        if text.contains("certificate") || text.contains("tls") || text.contains("TLS") {
+        let sources = source_messages(&e);
+        let text = match sources.last() {
+            Some(cause) => format!("{e}: {cause}"),
+            None => e.to_string(),
+        };
+        if is_tls_chain(&sources) {
             return Self::Tls(text);
         }
         Self::Network(text)
@@ -127,5 +154,53 @@ mod tests {
     fn enospc_maps_to_disk_full() {
         let e = std::io::Error::from_raw_os_error(ENOSPC_CODE);
         assert_eq!(EngineError::from_io(e).code(), "DISK_FULL");
+    }
+
+    #[test]
+    fn tls_is_detected_from_the_source_chain_not_the_top_level_text() {
+        // Review finding 2026-09-18: reqwest's Display never carries the TLS cause.
+        assert!(is_tls_chain(&[
+            "client error (Connect)".into(),
+            "invalid peer certificate: Expired".into()
+        ]));
+        assert!(is_tls_chain(&[
+            "received fatal alert: HandshakeFailure".into()
+        ]));
+        assert!(!is_tls_chain(&["connection reset by peer".into()]));
+        assert!(
+            !is_tls_chain(&[]),
+            "a URL containing 'tls' is never inspected"
+        );
+    }
+
+    #[test]
+    fn source_messages_walks_the_chain_deepest_last() {
+        use std::error::Error;
+        use std::fmt;
+
+        #[derive(Debug)]
+        struct Inner;
+        impl fmt::Display for Inner {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "deep")
+            }
+        }
+        impl Error for Inner {}
+
+        #[derive(Debug)]
+        struct Outer(Inner);
+        impl fmt::Display for Outer {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "outer")
+            }
+        }
+        impl Error for Outer {
+            fn source(&self) -> Option<&(dyn Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let msgs = source_messages(&Outer(Inner));
+        assert_eq!(msgs, vec!["deep".to_string()]);
     }
 }
