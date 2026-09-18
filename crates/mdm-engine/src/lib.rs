@@ -16,6 +16,7 @@ pub mod filename;
 pub mod plan;
 pub mod probe;
 pub mod request;
+pub mod segment;
 pub use engine::{Engine, EngineConfig, Proxy};
 pub use error::EngineError;
 pub use file::{PartFile, PART_SUFFIX};

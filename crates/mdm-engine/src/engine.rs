@@ -26,6 +26,10 @@ pub struct EngineConfig {
     pub proxy: Proxy,
     /// TCP connect timeout.
     pub connect_timeout: Duration,
+    /// First retry delay; doubles per attempt up to `segment::RETRY_CAP`. Tests shorten it.
+    pub retry_base_delay: Duration,
+    /// No bytes for this long = the connection is dead; reconnect.
+    pub stall_timeout: Duration,
 }
 
 impl Default for EngineConfig {
@@ -35,6 +39,8 @@ impl Default for EngineConfig {
             user_agent: format!("MuznDownloadManager/{}", crate::VERSION),
             proxy: Proxy::System,
             connect_timeout: Duration::from_secs(20),
+            retry_base_delay: Duration::from_secs(1),
+            stall_timeout: Duration::from_secs(30),
         }
     }
 }

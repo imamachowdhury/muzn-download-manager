@@ -20,6 +20,8 @@ pub struct ServerCfg {
     pub head_allowed: AtomicBool,
     pub fail_first: AtomicU32,
     pub drop_after: AtomicU64,
+    /// The first N GET bodies send 1 000 bytes then hang forever.
+    pub hang_first: AtomicU32,
     pub etag: Mutex<String>,
     pub requests: AtomicU32,
     pub content_disposition: Mutex<Option<String>>,
@@ -32,6 +34,7 @@ impl Default for ServerCfg {
             head_allowed: AtomicBool::new(true),
             fail_first: AtomicU32::new(0),
             drop_after: AtomicU64::new(0),
+            hang_first: AtomicU32::new(0),
             etag: Mutex::new("\"v1\"".to_owned()),
             requests: AtomicU32::new(0),
             content_disposition: Mutex::new(None),
@@ -137,7 +140,27 @@ async fn file(State(s): State<AppState>, method: Method, headers: HeaderMap) -> 
     }
     let slice = s.data[start as usize..(start + len) as usize].to_vec();
     let drop_after = cfg.drop_after.load(Ordering::SeqCst);
-    let body = if drop_after > 0 && drop_after < len {
+    let hang = cfg
+        .hang_first
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        .is_ok();
+    let body = if hang {
+        let good = bytes::Bytes::from(slice[..slice.len().min(1000)].to_vec());
+        Body::from_stream(stream::unfold(0u8, move |state| {
+            let good = good.clone();
+            async move {
+                match state {
+                    0 => Some((Ok::<_, std::io::Error>(good), 1)),
+                    _ => {
+                        // Let hyper flush the headers and the first chunk, then hang forever.
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        std::future::pending::<()>().await;
+                        None
+                    }
+                }
+            }
+        }))
+    } else if drop_after > 0 && drop_after < len {
         let good = bytes::Bytes::from(slice[..drop_after as usize].to_vec());
         Body::from_stream(stream::unfold(0u8, move |state| {
             let good = good.clone();
