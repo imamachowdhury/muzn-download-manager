@@ -196,3 +196,23 @@ async fn progress_stream_reports_bytes_and_speed() {
     assert_eq!(last.downloaded, 8 * 1024 * 1024);
     assert_eq!(last.eta_secs, Some(0));
 }
+
+#[tokio::test]
+async fn fresh_start_discards_a_stale_larger_part_file() {
+    // Review finding 2026-09-18: PartFile::open never truncates, so a fresh
+    // start over an old, bigger .part kept the old tail after the new bytes.
+    let s = TestServer::start(1_000_000).await;
+    let d = tempfile::tempdir().unwrap();
+    std::fs::write(d.path().join("file.mdm.part"), vec![0xAAu8; 5_000_000]).unwrap();
+    let Outcome::Completed(path) = engine(4)
+        .start(spec(&s.file_url(), d.path()))
+        .await
+        .unwrap()
+        .wait()
+        .await
+    else {
+        panic!()
+    };
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 1_000_000);
+    assert_eq!(sha256_file(&path), sha256_bytes(&s.data));
+}

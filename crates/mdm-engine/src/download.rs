@@ -153,6 +153,9 @@ impl DownloadHandle {
 
 impl Engine {
     /// Probe, then start downloading. Errors here mean nothing was started.
+    ///
+    /// A fresh start discards any leftover `.mdm.part` of the same name; only a
+    /// resume reuses it.
     pub async fn start(&self, spec: DownloadSpec) -> Result<DownloadHandle, EngineError> {
         let probe = self.probe(&spec.url, &spec.extras).await?;
         let filename = spec
@@ -206,6 +209,13 @@ impl Engine {
             },
         };
 
+        // `PartFile::open` never truncates, because a resume depends on the
+        // bytes already there. A fresh start must therefore clear a leftover
+        // part file itself: writing the new download over a larger old one
+        // would leave the old tail behind the new bytes at `finish()`.
+        if spec.resume_from.is_none() && part_path.exists() {
+            std::fs::remove_file(&part_path).map_err(EngineError::from_io)?;
+        }
         let file = Arc::new(PartFile::open(&spec.dir, &filename, probe.size)?);
         let run = Run {
             engine: self.clone(),
