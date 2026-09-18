@@ -9,6 +9,7 @@
 /// Engine version, for User-Agent strings.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+pub mod download;
 pub mod engine;
 pub mod error;
 pub mod file;
@@ -17,6 +18,10 @@ pub mod plan;
 pub mod probe;
 pub mod request;
 pub mod segment;
+pub use download::{
+    DownloadHandle, DownloadSpec, Outcome, Progress, Resume, Status, PROGRESS_INTERVAL,
+    STEAL_MIN_REMAINING,
+};
 pub use engine::{Engine, EngineConfig, Proxy};
 pub use error::EngineError;
 pub use file::{PartFile, PART_SUFFIX};

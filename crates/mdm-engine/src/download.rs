@@ -1,0 +1,447 @@
+//! The orchestrator: probe, plan, run one worker per segment, publish
+//! progress, steal work from the slowest segment, finish the file.
+
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use tokio::sync::watch;
+use tokio::task::{JoinHandle, JoinSet};
+use tokio_util::sync::CancellationToken;
+use url::Url;
+
+use crate::engine::Engine;
+use crate::error::EngineError;
+use crate::file::{PartFile, PART_SUFFIX};
+use crate::plan::{plan_segments, SegmentState};
+use crate::probe::Probe;
+use crate::request::RequestExtras;
+use crate::segment::{fetch_segment, SegmentJob, SegmentRuntime};
+
+/// How often [`Progress`] is published while downloading.
+pub const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+/// A finished worker steals from a segment only if this much is left.
+pub const STEAL_MIN_REMAINING: u64 = 2 * 1024 * 1024;
+const SPEED_WINDOW: Duration = Duration::from_secs(2);
+
+/// Where a download is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Status {
+    /// Workers are running.
+    Downloading,
+    /// Stopped by `pause()`; segments are safe to persist and resume.
+    Paused,
+    /// Renamed to its final name.
+    Completed,
+    /// A permanent error; see the [`Outcome`].
+    Failed,
+    /// Stopped by `cancel()`.
+    Cancelled,
+}
+
+/// A snapshot for the UI.
+#[derive(Clone, Debug)]
+pub struct Progress {
+    /// Total size when known.
+    pub total: Option<u64>,
+    /// Bytes written so far, all segments.
+    pub downloaded: u64,
+    /// Bytes per second over the last two seconds.
+    pub speed_bps: u64,
+    /// Seconds left at the current speed; `None` when unknown.
+    pub eta_secs: Option<u64>,
+    /// Every segment, including stolen ones.
+    pub segments: Vec<SegmentState>,
+    /// Current status.
+    pub status: Status,
+}
+
+/// How a download ended.
+#[derive(Debug)]
+pub enum Outcome {
+    /// The final path.
+    Completed(PathBuf),
+    /// Persist these and pass them back as [`Resume::segments`].
+    Paused(Vec<SegmentState>),
+    /// A permanent error; the part file is kept for a later resume.
+    Failed {
+        /// Why.
+        error: EngineError,
+        /// State at the time of failure.
+        segments: Vec<SegmentState>,
+    },
+    /// Cancelled; the part file is left for the caller to delete.
+    Cancelled,
+}
+
+/// What a resume needs to check the source is unchanged.
+#[derive(Clone, Debug)]
+pub struct Resume {
+    /// From the previous `Outcome::Paused` / `Failed` or the last flushed progress.
+    pub segments: Vec<SegmentState>,
+    /// Size at the original probe.
+    pub size: u64,
+    /// ETag at the original probe.
+    pub etag: Option<String>,
+    /// Last-Modified at the original probe.
+    pub last_modified: Option<String>,
+}
+
+/// One download request.
+#[derive(Clone, Debug)]
+pub struct DownloadSpec {
+    /// Where from.
+    pub url: Url,
+    /// Directory for the file.
+    pub dir: PathBuf,
+    /// Override the probed name.
+    pub filename: Option<String>,
+    /// Headers and cookies.
+    pub extras: RequestExtras,
+    /// Continue a previous attempt.
+    pub resume_from: Option<Resume>,
+}
+
+const STOP_NONE: u8 = 0;
+const STOP_PAUSE: u8 = 1;
+const STOP_CANCEL: u8 = 2;
+
+/// A running download.
+#[derive(Debug)]
+pub struct DownloadHandle {
+    probe: Probe,
+    part_path: PathBuf,
+    rx: watch::Receiver<Progress>,
+    cancel: CancellationToken,
+    stop: Arc<AtomicU8>,
+    join: JoinHandle<Outcome>,
+}
+
+impl DownloadHandle {
+    /// What the probe learned.
+    pub fn probe(&self) -> &Probe {
+        &self.probe
+    }
+    /// The `.mdm.part` path.
+    pub fn part_path(&self) -> &Path {
+        &self.part_path
+    }
+    /// Progress stream; the current value is available at once.
+    pub fn subscribe(&self) -> watch::Receiver<Progress> {
+        self.rx.clone()
+    }
+    /// Stop the workers; `wait()` returns `Outcome::Paused`.
+    pub fn pause(&self) {
+        self.stop.store(STOP_PAUSE, Ordering::SeqCst);
+        self.cancel.cancel();
+    }
+    /// Stop the workers; `wait()` returns `Outcome::Cancelled`.
+    pub fn cancel(&self) {
+        self.stop.store(STOP_CANCEL, Ordering::SeqCst);
+        self.cancel.cancel();
+    }
+    /// Wait for the end.
+    pub async fn wait(self) -> Outcome {
+        self.join.await.unwrap_or_else(|_| Outcome::Failed {
+            error: EngineError::Network("download task panicked".into()),
+            segments: Vec::new(),
+        })
+    }
+}
+
+impl Engine {
+    /// Probe, then start downloading. Errors here mean nothing was started.
+    pub async fn start(&self, spec: DownloadSpec) -> Result<DownloadHandle, EngineError> {
+        let probe = self.probe(&spec.url, &spec.extras).await?;
+        let filename = spec
+            .filename
+            .clone()
+            .unwrap_or_else(|| probe.filename.clone());
+        let part_path = spec.dir.join(format!("{filename}{PART_SUFFIX}"));
+
+        let (segments, ranged): (Vec<Arc<SegmentRuntime>>, bool) = match &spec.resume_from {
+            Some(r) => {
+                if !probe.ranges {
+                    return Err(EngineError::RangeNotSupported);
+                }
+                let changed = probe.size != Some(r.size)
+                    || match (&probe.etag, &r.etag) {
+                        (Some(a), Some(b)) => a != b,
+                        (None, None) => probe.last_modified != r.last_modified,
+                        _ => true,
+                    };
+                if changed {
+                    return Err(EngineError::SourceChanged);
+                }
+                if !part_path.exists() {
+                    return Err(EngineError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "part file missing; start over",
+                    )));
+                }
+                (
+                    r.segments
+                        .iter()
+                        .map(|s| Arc::new(SegmentRuntime::from_state(s)))
+                        .collect(),
+                    true,
+                )
+            }
+            None => match (probe.size, probe.ranges) {
+                (Some(size), true) => (
+                    plan_segments(size, self.cfg.max_connections)
+                        .iter()
+                        .map(|s| Arc::new(SegmentRuntime::from_state(s)))
+                        .collect(),
+                    true,
+                ),
+                (Some(0), false) => (Vec::new(), false),
+                (Some(size), false) => (
+                    vec![Arc::new(SegmentRuntime::new(0, 0, Some(size - 1), 0))],
+                    false,
+                ),
+                (None, _) => (vec![Arc::new(SegmentRuntime::new(0, 0, None, 0))], false),
+            },
+        };
+
+        let file = Arc::new(PartFile::open(&spec.dir, &filename, probe.size)?);
+        let run = Run {
+            engine: self.clone(),
+            url: probe.final_url.clone(),
+            extras: spec.extras.clone(),
+            file,
+            segments: Mutex::new(segments),
+            ranged,
+            total: probe.size,
+            cancel: CancellationToken::new(),
+            stop: Arc::new(AtomicU8::new(STOP_NONE)),
+        };
+        let (tx, rx) = watch::channel(run.progress(0, Status::Downloading));
+        let cancel = run.cancel.clone();
+        let stop = run.stop.clone();
+        let join = tokio::spawn(run.run(tx));
+        Ok(DownloadHandle {
+            probe,
+            part_path,
+            rx,
+            cancel,
+            stop,
+            join,
+        })
+    }
+}
+
+struct Run {
+    engine: Engine,
+    url: Url,
+    extras: RequestExtras,
+    file: Arc<PartFile>,
+    segments: Mutex<Vec<Arc<SegmentRuntime>>>,
+    ranged: bool,
+    total: Option<u64>,
+    cancel: CancellationToken,
+    stop: Arc<AtomicU8>,
+}
+
+impl Run {
+    fn job(&self, seg: Arc<SegmentRuntime>) -> SegmentJob {
+        SegmentJob {
+            client: self.engine.client.clone(),
+            url: self.url.clone(),
+            extras: self.extras.clone(),
+            file: self.file.clone(),
+            seg,
+            ranged: self.ranged,
+            cancel: self.cancel.clone(),
+            retry_base_delay: self.engine.cfg.retry_base_delay,
+            stall_timeout: self.engine.cfg.stall_timeout,
+        }
+    }
+
+    fn snapshot(&self) -> Vec<SegmentState> {
+        let mut v: Vec<SegmentState> = self
+            .segments
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.snapshot())
+            .collect();
+        v.sort_by_key(|s| s.idx);
+        v
+    }
+
+    fn progress(&self, speed_bps: u64, status: Status) -> Progress {
+        let segments = self.snapshot();
+        let downloaded = segments.iter().map(|s| s.downloaded).sum();
+        let eta_secs = match (self.total, speed_bps) {
+            (Some(t), _) if t <= downloaded => Some(0),
+            (Some(t), s) if s > 0 => Some((t - downloaded).div_ceil(s)),
+            _ => None,
+        };
+        Progress {
+            total: self.total,
+            downloaded,
+            speed_bps,
+            eta_secs,
+            segments,
+            status,
+        }
+    }
+
+    /// Split the largest remaining range and return a job for its second half.
+    fn steal(&self) -> Option<SegmentJob> {
+        if !self.ranged {
+            return None;
+        }
+        let mut segs = self.segments.lock().unwrap();
+        let victim = segs
+            .iter()
+            .filter(|s| s.remaining().unwrap_or(0) > STEAL_MIN_REMAINING)
+            .max_by_key(|s| s.remaining().unwrap_or(0))?
+            .clone();
+        let next = victim.next_offset();
+        let end = victim.end.load(Ordering::SeqCst);
+        let remaining = (end + 1).saturating_sub(next);
+        if remaining <= STEAL_MIN_REMAINING {
+            return None;
+        }
+        let mid = next + remaining / 2;
+        victim.end.store(mid - 1, Ordering::SeqCst);
+        let idx = segs.iter().map(|s| s.idx).max().map_or(0, |m| m + 1);
+        let fresh = Arc::new(SegmentRuntime::new(idx, mid, Some(end), 0));
+        segs.push(fresh.clone());
+        tracing::debug!(victim = victim.idx, new = idx, mid, end, "work stolen");
+        drop(segs);
+        Some(self.job(fresh))
+    }
+
+    async fn run(self, tx: watch::Sender<Progress>) -> Outcome {
+        let mut set: JoinSet<Result<(), EngineError>> = JoinSet::new();
+        for seg in self.segments.lock().unwrap().iter().cloned() {
+            set.spawn(fetch_segment(self.job(seg)));
+        }
+        let mut ticker = tokio::time::interval(PROGRESS_INTERVAL);
+        let mut meter = SpeedMeter::default();
+        let mut failure: Option<EngineError> = None;
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let p = self.progress(0, Status::Downloading);
+                    let speed = meter.push(p.downloaded);
+                    tx.send_replace(Progress { speed_bps: speed, ..p });
+                }
+                res = set.join_next() => match res {
+                    None => break,
+                    Some(Ok(Ok(()))) => {
+                        if failure.is_none() && !self.cancel.is_cancelled() {
+                            if let Some(job) = self.steal() {
+                                set.spawn(fetch_segment(job));
+                            }
+                        }
+                    }
+                    Some(Ok(Err(EngineError::Cancelled))) => {}
+                    Some(Ok(Err(e))) => {
+                        if failure.is_none() {
+                            failure = Some(e);
+                            self.cancel.cancel();
+                        }
+                    }
+                    Some(Err(_)) => {
+                        if failure.is_none() {
+                            failure = Some(EngineError::Network("worker panicked".into()));
+                            self.cancel.cancel();
+                        }
+                    }
+                }
+            }
+        }
+
+        // Everything the final `Progress` needs is read from `self` HERE, while
+        // `self` is still whole: taking the part file out below is a partial
+        // move, after which no `&self` method may be called. `Run` must stay
+        // free of a `Drop` impl for that move to be allowed.
+        let segments = self.snapshot();
+        let downloaded: u64 = segments.iter().map(|s| s.downloaded).sum();
+        let total = self.total;
+        let stop = self.stop.load(Ordering::SeqCst);
+        let all_done = segments.iter().all(|s| s.is_done());
+        let file = self.file;
+
+        let outcome = if let Some(error) = failure {
+            Outcome::Failed {
+                error,
+                segments: segments.clone(),
+            }
+        } else {
+            match stop {
+                STOP_PAUSE => Outcome::Paused(segments.clone()),
+                STOP_CANCEL => Outcome::Cancelled,
+                _ if all_done => match Arc::try_unwrap(file) {
+                    Ok(file) => match file.finish() {
+                        Ok(path) => Outcome::Completed(path),
+                        Err(error) => Outcome::Failed {
+                            error,
+                            segments: segments.clone(),
+                        },
+                    },
+                    Err(_) => Outcome::Failed {
+                        error: EngineError::Network("part file still in use".into()),
+                        segments: segments.clone(),
+                    },
+                },
+                _ => Outcome::Failed {
+                    error: EngineError::Network("workers ended with bytes missing".into()),
+                    segments: segments.clone(),
+                },
+            }
+        };
+        let status = match &outcome {
+            Outcome::Completed(_) => Status::Completed,
+            Outcome::Paused(_) => Status::Paused,
+            Outcome::Failed { .. } => Status::Failed,
+            Outcome::Cancelled => Status::Cancelled,
+        };
+        tx.send_replace(Progress {
+            total,
+            downloaded,
+            speed_bps: 0,
+            // Nothing is being fetched any more: the only honest estimate is
+            // "no time left", and only when every byte is in.
+            eta_secs: match total {
+                Some(t) if downloaded >= t => Some(0),
+                _ => None,
+            },
+            segments,
+            status,
+        });
+        outcome
+    }
+}
+
+#[derive(Default)]
+struct SpeedMeter {
+    samples: VecDeque<(Instant, u64)>,
+}
+
+impl SpeedMeter {
+    /// Record `downloaded` now; return bytes/s over the window.
+    fn push(&mut self, downloaded: u64) -> u64 {
+        let now = Instant::now();
+        self.samples.push_back((now, downloaded));
+        while let Some(&(t, _)) = self.samples.front() {
+            if now.duration_since(t) > SPEED_WINDOW && self.samples.len() > 2 {
+                self.samples.pop_front();
+            } else {
+                break;
+            }
+        }
+        let (t0, b0) = *self.samples.front().unwrap();
+        let dt = now.duration_since(t0).as_secs_f64();
+        if dt < 0.05 {
+            return 0;
+        }
+        ((downloaded.saturating_sub(b0)) as f64 / dt) as u64
+    }
+}
