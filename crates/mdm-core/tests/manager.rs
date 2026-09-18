@@ -499,3 +499,18 @@ async fn a_failed_download_resumes_from_its_saved_segments() {
     assert_eq!(sha256_file(&d.path().join("file")), sha256_bytes(&s.data));
     assert!(s.cfg.requests.load(Ordering::SeqCst) > before);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pause_resume_pause_ends_paused() {
+    // Re-review finding 2026-09-19: a pending resume survived a later pause.
+    let s = TestServer::start(8 * 1024 * 1024).await;
+    let d = tempfile::tempdir().unwrap();
+    let m = manager(d.path());
+    let id = parked(&s, &m).await;
+    m.pause(&id).unwrap();
+    m.resume(&id).unwrap();
+    m.pause(&id).unwrap();
+    wait_for(&m, &id, DownloadStatus::Paused).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(m.get(&id).unwrap().unwrap().status, DownloadStatus::Paused);
+}

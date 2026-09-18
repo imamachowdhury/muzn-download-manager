@@ -77,14 +77,17 @@ impl Slot {
         }
     }
 
-    /// Raise the intent only if it outranks whatever is already there —
+    /// Every stop request cancels a pending resume, whether or not it raises
+    /// the intent: this is asking to stop, and a resume that arrived earlier
+    /// is not what should happen once this download actually stops. Then
+    /// raise the intent only if it outranks whatever is already there —
     /// intents rank, they never overwrite a stronger one that arrived first.
-    /// When it does raise: clear a pending resume (this is asking for
-    /// something else), wake a probe waiting on the token, and stop an
+    /// When it does raise: wake a probe waiting on the token, and stop an
     /// engine control if one is attached, according to the intent that just
     /// won: PAUSE/SHUTDOWN pause it, everything else (CANCEL, REMOVE)
-    /// cancels it. When it does not raise, nothing here is touched.
+    /// cancels it. When it does not raise, nothing else here is touched.
     fn signal(&self, intent: u8) {
+        self.resume_after.store(false, Ordering::SeqCst);
         let raised = self
             .intent
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
@@ -94,7 +97,6 @@ impl Slot {
         if !raised {
             return;
         }
-        self.resume_after.store(false, Ordering::SeqCst);
         self.token.cancel();
         if let Some(control) = self.control.lock().unwrap().as_ref() {
             if intent == INTENT_PAUSE || intent == INTENT_SHUTDOWN {
@@ -241,13 +243,18 @@ impl Manager {
     }
 
     /// Resume a paused, failed or cancelled download (a cancelled one starts from zero).
-    /// If it is still running, remember the request instead: a later
-    /// PAUSE/SHUTDOWN/CANCEL/REMOVE clears it, otherwise the driver queues
-    /// the row again once it stops.
+    /// If it is still running but already stopping (some PAUSE/SHUTDOWN/
+    /// CANCEL/REMOVE got there first), remember the request instead: a later
+    /// stop signal clears it again, otherwise the driver queues the row once
+    /// it actually stops. Resuming a healthy running download is a no-op —
+    /// it must not silently re-queue the download if it later fails on its
+    /// own.
     pub fn resume(&self, id: &DownloadId) -> Result<()> {
         let running = self.inner.running.lock().unwrap();
         if let Some(slot) = running.get(id) {
-            slot.resume_after.store(true, Ordering::SeqCst);
+            if slot.intent.load(Ordering::SeqCst) != INTENT_NONE {
+                slot.resume_after.store(true, Ordering::SeqCst);
+            }
             return Ok(());
         }
         let row = self.inner.require(id)?;
