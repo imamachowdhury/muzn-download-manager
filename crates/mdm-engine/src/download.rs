@@ -73,13 +73,15 @@ pub struct Progress {
 pub enum Outcome {
     /// The final path.
     Completed(PathBuf),
-    /// Persist these and pass them back as [`Resume::segments`].
+    /// The durable segments (as of the last successful fsync) — safe to
+    /// persist; pass them back as [`Resume::segments`].
     Paused(Vec<SegmentState>),
     /// A permanent error; the part file is kept for a later resume.
     Failed {
         /// Why.
         error: EngineError,
-        /// State at the time of failure.
+        /// The durable segments (as of the last successful fsync) — safe to
+        /// persist.
         segments: Vec<SegmentState>,
     },
     /// Cancelled; the part file is left for the caller to delete.
@@ -561,10 +563,14 @@ impl Run {
         let durable = self.durable.lock().unwrap().clone();
         let file = self.file;
 
+        // Every outcome but Completed carries the DURABLE snapshot: the caller
+        // persists it, and after a failed final sync or `finish()` the live
+        // segments would claim bytes that never reached the disk. After a
+        // successful final sync the two are equal.
         let outcome = if let Some(error) = failure {
             Outcome::Failed {
                 error,
-                segments: segments.clone(),
+                segments: durable.clone(),
             }
         } else if stop == STOP_CANCEL {
             Outcome::Cancelled
@@ -574,20 +580,20 @@ impl Run {
                     Ok(path) => Outcome::Completed(path),
                     Err(error) => Outcome::Failed {
                         error,
-                        segments: segments.clone(),
+                        segments: durable.clone(),
                     },
                 },
                 Err(_) => Outcome::Failed {
                     error: EngineError::Internal("part file still in use".into()),
-                    segments: segments.clone(),
+                    segments: durable.clone(),
                 },
             }
         } else if stop == STOP_PAUSE {
-            Outcome::Paused(segments.clone())
+            Outcome::Paused(durable.clone())
         } else {
             Outcome::Failed {
                 error: EngineError::Internal("workers ended with bytes missing".into()),
-                segments: segments.clone(),
+                segments: durable.clone(),
             }
         };
         let status = match &outcome {

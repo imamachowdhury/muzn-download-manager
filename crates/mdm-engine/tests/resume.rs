@@ -353,11 +353,24 @@ async fn a_paused_outcome_is_durable() {
     let d = tempfile::tempdir().unwrap();
     s.cfg.hang_first.store(4, Ordering::SeqCst);
     let h = engine().start(spec(&s, d.path(), None)).await.unwrap();
-    let rx = h.subscribe();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut rx = h.subscribe();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            rx.changed().await.unwrap();
+            if rx.borrow().downloaded >= 4000 {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the four hung bodies should deliver 4 000 bytes within 20 s");
     h.pause();
     let Outcome::Paused(segs) = h.wait().await else {
         panic!()
     };
+    assert!(
+        segs.iter().map(|s| s.downloaded).sum::<u64>() > 0,
+        "the download paused with bytes written"
+    );
     assert_eq!(rx.borrow().durable_segments, segs);
 }
