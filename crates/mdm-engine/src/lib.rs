@@ -11,12 +11,14 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod engine;
 pub mod error;
+pub mod file;
 pub mod filename;
 pub mod plan;
 pub mod probe;
 pub mod request;
 pub use engine::{Engine, EngineConfig, Proxy};
 pub use error::EngineError;
+pub use file::{PartFile, PART_SUFFIX};
 pub use plan::{plan_segments, SegmentState, MAX_CONNECTIONS, MIN_SEGMENT_BYTES};
 pub use probe::Probe;
 pub use request::{Cookie, RequestExtras};
