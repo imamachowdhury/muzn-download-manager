@@ -5,6 +5,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{Path as AxPath, State};
@@ -25,6 +26,9 @@ pub struct ServerCfg {
     pub etag: Mutex<String>,
     pub requests: AtomicU32,
     pub content_disposition: Mutex<Option<String>>,
+    /// Stream bodies in 64 KiB chunks with this pause between them, so a test
+    /// can watch a download in flight.
+    pub chunk_delay_ms: AtomicU64,
 }
 
 impl Default for ServerCfg {
@@ -38,6 +42,7 @@ impl Default for ServerCfg {
             etag: Mutex::new("\"v1\"".to_owned()),
             requests: AtomicU32::new(0),
             content_disposition: Mutex::new(None),
+            chunk_delay_ms: AtomicU64::new(0),
         }
     }
 }
@@ -144,6 +149,7 @@ async fn file(State(s): State<AppState>, method: Method, headers: HeaderMap) -> 
         .hang_first
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
         .is_ok();
+    let delay = cfg.chunk_delay_ms.load(Ordering::SeqCst);
     let body = if hang {
         let good = bytes::Bytes::from(slice[..slice.len().min(1000)].to_vec());
         Body::from_stream(stream::unfold(0u8, move |state| {
@@ -182,6 +188,16 @@ async fn file(State(s): State<AppState>, method: Method, headers: HeaderMap) -> 
                 }
             }
         }))
+    } else if delay > 0 {
+        let chunks: Vec<Vec<u8>> = slice.chunks(64 * 1024).map(|c| c.to_vec()).collect();
+        Body::from_stream(stream::unfold(
+            chunks.into_iter(),
+            move |mut it| async move {
+                let c = it.next()?;
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                Some((Ok::<_, std::io::Error>(bytes::Bytes::from(c)), it))
+            },
+        ))
     } else {
         Body::from(slice)
     };
