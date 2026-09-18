@@ -170,7 +170,7 @@ fn parse_range(v: &str, total: u64) -> Option<(u64, u64)> {
     let (a, b) = spec.split_once('-')?;
     let start: u64 = a.parse().ok()?;
     let end: u64 = if b.is_empty() {
-        total - 1
+        total.saturating_sub(1)
     } else {
         b.parse().ok()?
     };

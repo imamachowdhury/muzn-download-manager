@@ -73,6 +73,17 @@ async fn switches_change_behaviour() {
         .await
         .unwrap();
     assert_eq!(r.status(), 302);
+
+    // Review finding 2026-09-18: an open-ended range on an empty file must not panic.
+    let empty = TestServer::start(0).await;
+    let r = c
+        .get(empty.file_url())
+        .header("Range", "bytes=0-")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.bytes().await.unwrap().len(), 0);
 }
 
 #[test]
