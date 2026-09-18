@@ -1,7 +1,7 @@
 //! The orchestrator: probe, plan, run one worker per segment, publish
 //! progress, steal work from the slowest segment, finish the file.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -178,6 +178,7 @@ impl DownloadControl {
 pub struct DownloadHandle {
     probe: Probe,
     part_path: PathBuf,
+    filename: String,
     rx: watch::Receiver<Progress>,
     cancel: CancellationToken,
     stop: Arc<AtomicU8>,
@@ -195,6 +196,12 @@ impl DownloadHandle {
     /// The `.mdm.part` path.
     pub fn part_path(&self) -> &Path {
         &self.part_path
+    }
+    /// The name actually used for this download — the probed (or overridden)
+    /// name, or `name (n).ext` when that name was already claimed by another
+    /// live download (`Engine::start`).
+    pub fn filename(&self) -> &str {
+        &self.filename
     }
     /// Progress stream; the current value is available at once.
     pub fn subscribe(&self) -> watch::Receiver<Progress> {
@@ -238,15 +245,46 @@ impl Engine {
     /// whose part file has the wrong length, is refused with
     /// [`EngineError::InvalidResume`].
     ///
-    /// The caller keeps (dir, filename) unique among live downloads; two live
-    /// downloads of the same name share one part file.
+    /// A second live download of the same name gets `name (1).ext`; a resume
+    /// whose part file is already claimed by another live download is
+    /// refused with [`EngineError::InvalidResume`] instead (its name is
+    /// fixed, so there is nowhere else to put it).
     pub async fn start(&self, spec: DownloadSpec) -> Result<DownloadHandle, EngineError> {
         let probe = self.probe(&spec.url, &spec.extras).await?;
-        let filename = spec
+        let base_filename = spec
             .filename
             .clone()
             .unwrap_or_else(|| probe.filename.clone());
-        let part_path = spec.dir.join(format!("{filename}{PART_SUFFIX}"));
+
+        // Claim a live part path exclusively before touching the filesystem:
+        // a fresh start whose chosen name is already live is renamed to
+        // `name (n).ext`; a resume of a live path is refused outright. The
+        // claim is released (`PartClaim::drop`) when the run ends.
+        let (filename, part_path, claim) = {
+            let mut live = self.live_parts.lock().unwrap();
+            let mut filename = base_filename.clone();
+            let mut part_path = spec.dir.join(format!("{filename}{PART_SUFFIX}"));
+            if spec.resume_from.is_some() {
+                if live.contains(&part_path) {
+                    return Err(EngineError::InvalidResume(
+                        "the part file is in use by another download".into(),
+                    ));
+                }
+            } else {
+                let mut n = 1u32;
+                while live.contains(&part_path) {
+                    filename = numbered_filename(&base_filename, n);
+                    part_path = spec.dir.join(format!("{filename}{PART_SUFFIX}"));
+                    n += 1;
+                }
+            }
+            live.insert(part_path.clone());
+            let claim = PartClaim {
+                registry: self.live_parts.clone(),
+                path: part_path.clone(),
+            };
+            (filename, part_path, claim)
+        };
 
         let (segments, ranged): (Vec<Arc<SegmentRuntime>>, bool) = match &spec.resume_from {
             Some(r) => {
@@ -309,10 +347,20 @@ impl Engine {
             v
         };
         let file = Arc::new(PartFile::open(&spec.dir, &filename, probe.size)?);
+        // A redirect that left the caller's origin gets none of its cookies
+        // or Authorization: workers fetch `final_url` directly, so unlike
+        // `probe()` above (which goes through reqwest's own redirect-time
+        // header stripping) nothing else would drop them for a cross-origin
+        // target.
+        let extras = if spec.url.origin() == probe.final_url.origin() {
+            spec.extras.clone()
+        } else {
+            spec.extras.without_credentials()
+        };
         let run = Run {
             engine: self.clone(),
             url: probe.final_url.clone(),
-            extras: spec.extras.clone(),
+            extras,
             file,
             segments: Mutex::new(segments),
             durable: Mutex::new(durable),
@@ -320,6 +368,7 @@ impl Engine {
             total: probe.size,
             cancel: CancellationToken::new(),
             stop: Arc::new(AtomicU8::new(STOP_NONE)),
+            _claim: claim,
         };
         let (tx, rx) = watch::channel(run.progress(0, Status::Downloading));
         let cancel = run.cancel.clone();
@@ -333,12 +382,32 @@ impl Engine {
         Ok(DownloadHandle {
             probe,
             part_path,
+            filename,
             rx,
             cancel,
             stop,
             join,
             guard,
         })
+    }
+}
+
+/// `stem (n).ext` for a live-name clash, using the same split rule as
+/// `file::free_name`'s own numbering (`file::split_ext`).
+fn numbered_filename(filename: &str, n: u32) -> String {
+    let (stem, ext) = crate::file::split_ext(filename);
+    format!("{stem} ({n}){ext}")
+}
+
+/// Releases a live part path when the run ends.
+struct PartClaim {
+    registry: Arc<Mutex<HashSet<PathBuf>>>,
+    path: PathBuf,
+}
+
+impl Drop for PartClaim {
+    fn drop(&mut self) {
+        self.registry.lock().unwrap().remove(&self.path);
     }
 }
 
@@ -408,6 +477,12 @@ struct Run {
     total: Option<u64>,
     cancel: CancellationToken,
     stop: Arc<AtomicU8>,
+    // Never given its own accessor: it exists only to release the live-part
+    // claim (`PartClaim::drop`) when `Run` is dropped at the end of `run()`.
+    // `Run` itself must stay free of a `Drop` impl (see `run()`'s partial
+    // move of `self.file`), and a field whose type implements `Drop` does
+    // not force that on the containing struct.
+    _claim: PartClaim,
 }
 
 impl Run {

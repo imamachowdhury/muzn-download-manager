@@ -25,6 +25,14 @@ fn spec(url: &str, dir: &std::path::Path) -> DownloadSpec {
     }
 }
 
+fn with_cookie(mut sp: DownloadSpec) -> DownloadSpec {
+    sp.extras.cookies.push(mdm_engine::Cookie {
+        name: "session".into(),
+        value: "secret".into(),
+    });
+    sp
+}
+
 #[tokio::test]
 async fn segmented_happy_path() {
     let s = TestServer::start(16 * 1024 * 1024).await;
@@ -246,4 +254,73 @@ async fn fresh_start_discards_a_stale_larger_part_file() {
     };
     assert_eq!(std::fs::metadata(&path).unwrap().len(), 1_000_000);
     assert_eq!(sha256_file(&path), sha256_bytes(&s.data));
+}
+
+#[tokio::test]
+async fn cookies_are_not_sent_to_another_origin_after_a_redirect() {
+    // Final review 2026-09-18: workers fetch final_url directly, bypassing
+    // reqwest's own cross-host header stripping.
+    //
+    // The redirect target is reached via `localhost`; on a machine where that
+    // resolves to `::1` before `127.0.0.1` (observed here), connecting waits
+    // out hyper's IPv6-then-IPv4 fallback (~300 ms) before it lands on the
+    // server, which is bound to `127.0.0.1` only. `engine(2)`'s 300 ms
+    // `stall_timeout` — plenty for every other test, which never crosses a
+    // real network hop — is too tight a race against that exact fallback
+    // window, so this test alone gets a longer one.
+    let e = Engine::new(EngineConfig {
+        max_connections: 2,
+        retry_base_delay: Duration::from_millis(1),
+        stall_timeout: Duration::from_secs(2),
+        ..Default::default()
+    })
+    .unwrap();
+    let s = TestServer::start(1024 * 1024).await;
+    let d = tempfile::tempdir().unwrap();
+    let h = e
+        .start(with_cookie(spec(&s.redirect_to_ip_url(), d.path())))
+        .await
+        .unwrap();
+    let Outcome::Completed(path) = h.wait().await else {
+        panic!()
+    };
+    assert_eq!(sha256_file(&path), sha256_bytes(&s.data));
+    assert_eq!(*s.cfg.last_cookie.lock().unwrap(), None);
+}
+
+#[tokio::test]
+async fn cookies_are_kept_on_the_same_origin() {
+    let s = TestServer::start(1024 * 1024).await;
+    let d = tempfile::tempdir().unwrap();
+    let h = engine(2)
+        .start(with_cookie(spec(&s.redirect_url(), d.path())))
+        .await
+        .unwrap();
+    let Outcome::Completed(_) = h.wait().await else {
+        panic!()
+    };
+    assert_eq!(
+        s.cfg.last_cookie.lock().unwrap().as_deref(),
+        Some("session=secret")
+    );
+}
+
+#[tokio::test]
+async fn two_live_downloads_of_the_same_name_get_separate_part_files() {
+    // Final review 2026-09-18: they shared one .mdm.part before.
+    let s = TestServer::start(3 * 1024 * 1024).await;
+    s.cfg.chunk_delay_ms.store(2, Ordering::SeqCst);
+    let d = tempfile::tempdir().unwrap();
+    let e = engine(2);
+    let a = e.start(spec(&s.file_url(), d.path())).await.unwrap();
+    let b = e.start(spec(&s.file_url(), d.path())).await.unwrap();
+    assert_eq!(a.filename(), "file");
+    assert_eq!(b.filename(), "file (1)");
+    let (oa, ob) = tokio::join!(a.wait(), b.wait());
+    let (Outcome::Completed(pa), Outcome::Completed(pb)) = (oa, ob) else {
+        panic!()
+    };
+    assert_ne!(pa, pb);
+    assert_eq!(sha256_file(&pa), sha256_bytes(&s.data));
+    assert_eq!(sha256_file(&pb), sha256_bytes(&s.data));
 }

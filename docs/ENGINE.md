@@ -19,8 +19,11 @@ probe → plan → allocate → fetch (N workers) → complete
   Writes and fsyncs run on blocking threads.
 - **complete** (`download.rs`): fsync, rename, `name (1).ext` on a clash.
 
-The caller keeps (dir, filename) unique among live downloads; two live downloads of the
-same name share one part file.
+Cookies and `Authorization` are dropped when a redirect leaves the original origin;
+`Range`, `Host` and `Content-Length` from the caller are never sent.
+
+A second live download of the same name gets `name (1).ext`; a resume of a part file
+that is in use is refused (`INVALID_RESUME`).
 
 ## Progress, pause, resume
 

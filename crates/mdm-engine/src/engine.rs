@@ -1,5 +1,8 @@
 //! The engine: one shared HTTP client and its settings.
 
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::error::EngineError;
@@ -52,6 +55,10 @@ pub struct Engine {
     pub(crate) client: reqwest::Client,
     /// The engine configuration.
     pub(crate) cfg: EngineConfig,
+    /// Part file paths claimed by a currently-running download, shared by
+    /// every clone. `Engine::start` uses this so two live downloads of the
+    /// same name never write into one `.mdm.part`.
+    pub(crate) live_parts: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 impl Engine {
@@ -72,6 +79,7 @@ impl Engine {
         Ok(Engine {
             client: b.build()?,
             cfg,
+            live_parts: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 

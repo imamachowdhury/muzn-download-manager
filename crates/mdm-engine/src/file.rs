@@ -94,16 +94,24 @@ impl PartFile {
     }
 }
 
+/// Split `filename` into (stem, extension) on the last dot, unless that dot
+/// is the first character (dotfiles have no extension). Shared with the
+/// live-part numbering in `download.rs` so both agree on what "the
+/// extension" means.
+pub(crate) fn split_ext(filename: &str) -> (&str, &str) {
+    match filename.rfind('.') {
+        Some(i) if i > 0 => (&filename[..i], &filename[i..]),
+        _ => (filename, ""),
+    }
+}
+
 /// `name.ext` → `name (1).ext`, `name (2).ext` … until one does not exist.
 fn free_name(dir: &Path, filename: &str) -> PathBuf {
     let first = dir.join(filename);
     if !first.exists() {
         return first;
     }
-    let (stem, ext) = match filename.rfind('.') {
-        Some(i) if i > 0 => (&filename[..i], &filename[i..]),
-        _ => (filename, ""),
-    };
+    let (stem, ext) = split_ext(filename);
     (1u32..)
         .map(|n| dir.join(format!("{stem} ({n}){ext}")))
         .find(|p| !p.exists())

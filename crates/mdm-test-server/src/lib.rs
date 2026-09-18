@@ -31,6 +31,9 @@ pub struct ServerCfg {
     /// The first N GET or HEAD requests to `/file` never answer: no status,
     /// no headers. A GET is still counted in `requests`.
     pub hang_headers: AtomicU32,
+    /// The `Cookie` header of the last GET of `/file`; `None` when it carried
+    /// none (or there has not been one yet).
+    pub last_cookie: Mutex<Option<String>>,
 }
 
 impl Default for ServerCfg {
@@ -46,6 +49,7 @@ impl Default for ServerCfg {
             content_disposition: Mutex::new(None),
             chunk_delay_ms: AtomicU64::new(0),
             hang_headers: AtomicU32::new(0),
+            last_cookie: Mutex::new(None),
         }
     }
 }
@@ -54,34 +58,39 @@ impl Default for ServerCfg {
 struct AppState {
     data: Arc<Vec<u8>>,
     cfg: Arc<ServerCfg>,
+    port: u16,
 }
 
 pub struct TestServer {
     pub base: String,
     pub data: Arc<Vec<u8>>,
     pub cfg: Arc<ServerCfg>,
+    port: u16,
 }
 
 impl TestServer {
     pub async fn start(size: usize) -> TestServer {
         let data = Arc::new(payload(size));
         let cfg = Arc::new(ServerCfg::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
         let state = AppState {
             data: data.clone(),
             cfg: cfg.clone(),
+            port: addr.port(),
         };
         let app = Router::new()
             .route("/file", get(file))
             .route("/redirect", get(redirect))
+            .route("/redirect-to-ip", get(redirect_to_ip))
             .route("/status/:code", get(status))
             .with_state(state);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         TestServer {
             base: format!("http://{addr}"),
             data,
             cfg,
+            port: addr.port(),
         }
     }
     pub fn file_url(&self) -> String {
@@ -89,6 +98,11 @@ impl TestServer {
     }
     pub fn redirect_url(&self) -> String {
         format!("{}/redirect", self.base)
+    }
+    /// A redirect to `/file` on `127.0.0.1`, reached via `localhost` — a
+    /// different origin even when both resolve to the same loopback host.
+    pub fn redirect_to_ip_url(&self) -> String {
+        format!("http://localhost:{}/redirect-to-ip", self.port)
     }
     pub fn status_url(&self, code: u16) -> String {
         format!("{}/status/{code}", self.base)
@@ -102,6 +116,10 @@ async fn file(State(s): State<AppState>, method: Method, headers: HeaderMap) -> 
     }
     if method == Method::GET {
         cfg.requests.fetch_add(1, Ordering::SeqCst);
+        *cfg.last_cookie.lock().unwrap() = headers
+            .get(header::COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
     }
     let silent = cfg
         .hang_headers
@@ -230,6 +248,20 @@ fn parse_range(v: &str, total: u64) -> Option<(u64, u64)> {
 
 async fn redirect() -> Response {
     (StatusCode::FOUND, [(header::LOCATION, "/file")]).into_response()
+}
+
+/// Redirects across origins: `Location` is absolute and points at
+/// `127.0.0.1`, while this route itself is normally reached via `localhost`
+/// (`TestServer::redirect_to_ip_url`).
+async fn redirect_to_ip(State(s): State<AppState>) -> Response {
+    (
+        StatusCode::FOUND,
+        [(
+            header::LOCATION,
+            format!("http://127.0.0.1:{}/file", s.port),
+        )],
+    )
+        .into_response()
 }
 
 async fn status(AxPath(code): AxPath<u16>) -> Response {
