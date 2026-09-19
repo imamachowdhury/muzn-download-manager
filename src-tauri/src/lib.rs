@@ -58,10 +58,13 @@ pub fn run() {
         .invoke_handler(commands::handler())
         .build(tauri::generate_context!())
         .expect("building the Muzn Download Manager window failed");
-    app.run(|app, event| {
-        if let RunEvent::Exit = event {
-            shutdown(app);
-        }
+    app.run(|app, event| match event {
+        RunEvent::Exit => shutdown(app),
+        // macOS: clicking the Dock icon of a running app whose window is
+        // hidden to the tray brings the window back (final review M11).
+        #[cfg(target_os = "macos")]
+        RunEvent::Reopen { .. } => window::show_main(app),
+        _ => {}
     });
 }
 

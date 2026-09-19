@@ -41,3 +41,15 @@ open:
   instead of only delaying the sync.
 - The crash test should prove a resume by counting bytes served, not only by comparing the final
   SHA-256 — the hash alone cannot tell a real resume from a restart that redownloaded everything.
+
+## Found in Plan 3's final review
+
+- A setup failure panics invisibly in a release build (no console): show an error dialog and log to a file under the data dir.
+- Downloaded files carry no Windows Mark-of-the-Web (Plan 6).
+- GNOME without AppIndicator: the tray is built but invisible, so close-to-tray hides the window into nothing.
+- `open_path(to_string_lossy)` mangles non-UTF-8 paths.
+- No automated test of the 5 s shutdown grace.
+- Unused Android / iOS / Store icon sets in `src-tauri/icons`.
+- UI nits: `DownloadRowView`'s memo is defeated (a new `style` object each render); error toasts are polite, not assertive; the progressbar's aria-label is its value; `DetailPanel`'s segments `catch` is silent; `STATUS_LABEL` is imported from a component file.
+- Rust nits: `row_of` builds NOT_FOUND by hand; the test row fixture is duplicated; `build.rs` has no early return off Windows; `embed-resource` is not a workspace dependency; TypeScript is pinned to 6 for typescript-eslint.
+- Add an axe check (vitest-axe) to the gates.

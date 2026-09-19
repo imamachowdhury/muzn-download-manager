@@ -42,4 +42,3 @@ url.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tauri = { workspace = true, features = ["test"] }
-tokio = { workspace = true, features = ["full"] }
