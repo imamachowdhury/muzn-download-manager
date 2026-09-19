@@ -5,6 +5,7 @@ import { AddDialog } from "./components/AddDialog";
 import { DetailPanel } from "./components/DetailPanel";
 import { DownloadList } from "./components/DownloadList";
 import { FilterRail } from "./components/FilterRail";
+import { SettingsDialog } from "./components/SettingsDialog";
 import { TopBar } from "./components/TopBar";
 import { useBackend, useDownloadsStore, useManagerSync } from "./state/context";
 import { visibleRows } from "./state/downloads";
@@ -60,9 +61,8 @@ export function App() {
           <DetailPanel />
         </div>
       </div>
-      {/* Task 9 renders the settings dialog while `settingsOpen`. */}
       {adding && <AddDialog onClose={() => setAdding(false)} />}
-      {settingsOpen && null}
+      {settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} />}
       <ConfirmHost />
       <ToastHost />
     </div>
