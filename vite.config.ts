@@ -16,5 +16,8 @@ export default defineConfig({
     environment: "jsdom",
     setupFiles: ["src/test/setup.ts"],
     include: ["src/**/*.test.{ts,tsx}"],
+    // Vitest blanks CSS by default; styles.test.ts reads the real tokens
+    // (`styles.css?raw`) to pin their contrast ratios.
+    css: { include: [/styles\.css/] },
   },
 });

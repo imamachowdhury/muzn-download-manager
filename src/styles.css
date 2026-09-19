@@ -6,12 +6,16 @@
   --border: #d8dee1;
   --text: #1c2629;
   --text-muted: #5b6b70;
+  /* --accent: focus ring, segment fill, selection tint. --accent-strong: where
+     the teal carries TEXT (filled primary buttons, links) - WCAG AA 4.5:1
+     (final review I4, 2026-09-19; ratios pinned in styles.test.ts). */
   --accent: #0f9b8e;
+  --accent-strong: #0b7d72;
   --accent-text: #ffffff;
   --accent-soft: #d7f0ed;
-  --danger: #c4413b;
-  --warn: #b7791f;
-  --ok: #2f855a;
+  --danger: #b0352f;
+  --warn: #8a5a12;
+  --ok: #23694a;
   --radius-sm: 4px;
   --radius: 6px;
   --radius-lg: 10px;
@@ -32,6 +36,7 @@
     --text: #e4eaec;
     --text-muted: #9aabb0;
     --accent: #2cc4b4;
+    --accent-strong: #2cc4b4;
     --accent-text: #06201d;
     --accent-soft: #173c38;
     --danger: #ef6b64;
@@ -54,12 +59,12 @@ button, input, select { font: inherit; color: inherit; }
   height: 30px; padding: 0 12px; border-radius: var(--radius); border: 1px solid transparent;
   cursor: pointer; white-space: nowrap;
 }
-.primary-button { background: var(--accent); color: var(--accent-text); }
+.primary-button { background: var(--accent-strong); color: var(--accent-text); }
 .secondary-button { background: var(--surface); border-color: var(--border); }
 .secondary-button:hover:not(:disabled) { background: var(--surface-2); }
 .danger-button { background: var(--danger); color: var(--accent-text); }
 .primary-button:disabled, .secondary-button:disabled, .danger-button:disabled { opacity: .5; cursor: default; }
-.link-button { background: none; border: 0; padding: 0 4px; color: var(--accent); cursor: pointer; }
+.link-button { background: none; border: 0; padding: 0 4px; color: var(--accent-strong); cursor: pointer; }
 
 .topbar { display: flex; align-items: center; gap: 16px; padding: 8px 12px; background: var(--surface); border-bottom: 1px solid var(--border); }
 .topbar .brand { padding: 0; white-space: nowrap; }
