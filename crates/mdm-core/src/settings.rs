@@ -36,6 +36,10 @@ pub struct Settings {
     pub user_agent: Option<String>,
     /// Proxy policy.
     pub proxy: ProxySetting,
+    /// The window's close button hides the app to the tray (when there is one).
+    pub close_to_tray: bool,
+    /// Show an OS notification when a download completes.
+    pub notify_on_complete: bool,
 }
 
 impl Default for Settings {
@@ -46,6 +50,8 @@ impl Default for Settings {
             max_parallel: 3,
             user_agent: None,
             proxy: ProxySetting::System,
+            close_to_tray: true,
+            notify_on_complete: true,
         }
     }
 }

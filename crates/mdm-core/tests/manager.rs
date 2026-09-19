@@ -786,3 +786,59 @@ async fn settings_survive_a_restart_of_the_app() {
         (5, 12, d.path())
     );
 }
+
+#[tokio::test]
+async fn probe_previews_a_url_without_adding_it() {
+    let s = TestServer::start(3 * 1024 * 1024).await;
+    let d = tempfile::tempdir().unwrap();
+    let m = manager(d.path());
+    let p = m.probe(&s.file_url(), None).await.unwrap();
+    assert_eq!(p.filename, "file");
+    assert_eq!(p.size, Some(3 * 1024 * 1024));
+    assert!(p.resumable);
+    assert!(p.final_url.ends_with("/file"));
+    assert!(m.list().unwrap().is_empty(), "a probe never adds a row");
+}
+
+#[tokio::test]
+async fn probe_says_not_resumable_without_ranges() {
+    let s = TestServer::start(1024 * 1024).await;
+    s.cfg.ranges.store(false, Ordering::SeqCst);
+    let d = tempfile::tempdir().unwrap();
+    let m = manager(d.path());
+    let p = m.probe(&s.file_url(), None).await.unwrap();
+    assert!(!p.resumable);
+}
+
+#[tokio::test]
+async fn probe_refuses_what_add_refuses_and_passes_engine_codes_through() {
+    let s = TestServer::start(1024).await;
+    let d = tempfile::tempdir().unwrap();
+    let m = manager(d.path());
+    assert_eq!(
+        m.probe("ftp://example.com/x", None)
+            .await
+            .unwrap_err()
+            .code(),
+        "INVALID_URL"
+    );
+    assert_eq!(
+        m.probe(&s.status_url(404), None).await.unwrap_err().code(),
+        "HTTP_STATUS"
+    );
+}
+
+#[test]
+fn a_probe_preview_serialises_in_camel_case() {
+    let p = ProbePreview {
+        final_url: "https://x/y".into(),
+        filename: "y".into(),
+        size: None,
+        resumable: false,
+        mime: None,
+    };
+    let v = serde_json::to_value(&p).unwrap();
+    assert_eq!(v["finalUrl"], "https://x/y");
+    assert!(v["size"].is_null());
+    assert_eq!(v["resumable"], false);
+}

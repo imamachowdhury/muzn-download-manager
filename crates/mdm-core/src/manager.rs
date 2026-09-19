@@ -1,12 +1,16 @@
 //! The manager: a FIFO queue with at most `max_parallel` running downloads,
 //! each driven through the engine, persisted to the store, announced as events.
 
+use std::any::Any;
 use std::collections::HashMap;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use futures_util::FutureExt;
 use mdm_engine::{
     Cookie, DownloadControl, DownloadSpec, Engine, EngineError, Outcome, Progress, RequestExtras,
     Resume, SegmentState, Status, PART_SUFFIX,
@@ -204,18 +208,30 @@ impl Manager {
         Ok(s)
     }
 
+    /// Ask the server about a URL without adding it — the add dialog's live
+    /// preview. Uses the current settings' engine (proxy, user agent).
+    pub async fn probe(&self, url: &str, referrer: Option<&str>) -> Result<ProbePreview> {
+        let url = parse_http_url(url)?;
+        let mut extras = RequestExtras::default();
+        if let Some(r) = referrer.map(str::trim).filter(|r| !r.is_empty()) {
+            extras.headers.push(("Referer".into(), r.to_owned()));
+        }
+        let engine = self.inner.engine.lock().unwrap().clone();
+        let p = engine.probe(&url, &extras).await?;
+        Ok(ProbePreview {
+            final_url: p.final_url.to_string(),
+            filename: p.filename,
+            resumable: p.ranges && p.size.is_some(),
+            size: p.size,
+            mime: p.mime,
+        })
+    }
+
     /// Add a download (QUEUED, or PAUSED with `start_paused`). Callable from
     /// any thread (downloads it starts run on the manager's runtime). A
     /// caller's `filename` is sanitised (`mdm_engine::filename::sanitize`).
     pub fn add(&self, mut new: NewDownload) -> Result<DownloadRow> {
-        let url = Url::parse(new.url.trim())
-            .map_err(|e| CoreError::InvalidUrl(format!("{}: {e}", new.url)))?;
-        if !matches!(url.scheme(), "http" | "https") {
-            return Err(CoreError::InvalidUrl(format!(
-                "unsupported scheme {}",
-                url.scheme()
-            )));
-        }
+        let url = parse_http_url(&new.url)?;
         new.url = url.to_string();
         // A caller's file name is joined onto `dir`: sanitise it so `../x`,
         // `/abs/x` or `C:\x` can never write outside the folder. A blank
@@ -594,6 +610,18 @@ impl Inner {
     }
 }
 
+/// An http(s) URL, or INVALID_URL.
+fn parse_http_url(s: &str) -> Result<Url> {
+    let url = Url::parse(s.trim()).map_err(|e| CoreError::InvalidUrl(format!("{s}: {e}")))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(CoreError::InvalidUrl(format!(
+            "unsupported scheme {}",
+            url.scheme()
+        )));
+    }
+    Ok(url)
+}
+
 fn remove_if_present(p: &Path) -> Result<()> {
     match std::fs::remove_file(p) {
         Ok(()) => Ok(()),
@@ -634,8 +662,27 @@ fn needs_fresh_start(e: &EngineError) -> bool {
     ) || matches!(e, EngineError::Io(io) if io.kind() == std::io::ErrorKind::NotFound)
 }
 
+/// Run a driver future; a panic inside it becomes an INTERNAL error instead of
+/// unwinding past `finish()` and leaking the queue slot (Plan 2 backlog).
+async fn guarded<F: Future<Output = Result<()>>>(f: F) -> Result<()> {
+    match AssertUnwindSafe(f).catch_unwind().await {
+        Ok(r) => r,
+        Err(p) => Err(CoreError::Internal(panic_message(p.as_ref()))),
+    }
+}
+
+fn panic_message(p: &(dyn Any + Send)) -> String {
+    if let Some(s) = p.downcast_ref::<&str>() {
+        format!("a download task panicked: {s}")
+    } else if let Some(s) = p.downcast_ref::<String>() {
+        format!("a download task panicked: {s}")
+    } else {
+        "a download task panicked".into()
+    }
+}
+
 async fn drive(inner: Arc<Inner>, id: DownloadId, slot: Slot) {
-    if let Err(e) = drive_inner(&inner, &id, &slot).await {
+    if let Err(e) = guarded(drive_inner(&inner, &id, &slot)).await {
         tracing::error!(%id, error = %e, "driving a download failed");
         let _ = inner.set_status(
             &id,
@@ -739,8 +786,9 @@ async fn drive_inner(inner: &Arc<Inner>, id: &DownloadId, slot: &Slot) -> Result
                     inner.store.set_filename(id, name, now_ms())?;
                 }
                 if info.size.is_none() {
-                    let len = std::fs::metadata(&path)?.len();
-                    inner.store.set_size(id, len, now_ms())?;
+                    if let Some(len) = file_len(&path) {
+                        inner.store.set_size(id, len, now_ms())?;
+                    }
                 }
                 inner.set_status(id, DownloadStatus::Completed, None)?;
                 if slot.intent.load(Ordering::SeqCst) == INTENT_REMOVE {
@@ -775,8 +823,36 @@ async fn drive_inner(inner: &Arc<Inner>, id: &DownloadId, slot: &Slot) -> Result
     }
 }
 
+/// A finished file's length, or `None` if it cannot be read. A finished
+/// download is never turned into a FAILED one by a metadata error (Plan 2
+/// backlog); its size just stays unknown.
+fn file_len(path: &Path) -> Option<u64> {
+    match std::fs::metadata(path) {
+        Ok(m) => Some(m.len()),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "reading a finished file's size failed");
+            None
+        }
+    }
+}
+
+/// Whether a progress update is written to the store: only while downloading,
+/// at most once per `PERSIST_INTERVAL`, and only when the durable segments
+/// moved since the last save (a stalled download writes nothing; Plan 2 backlog).
+fn should_persist(
+    status: Status,
+    since_last: Duration,
+    durable: &[SegmentState],
+    last_saved: &[SegmentState],
+) -> bool {
+    status == Status::Downloading && since_last >= PERSIST_INTERVAL && durable != last_saved
+}
+
 async fn forward_progress(inner: Arc<Inner>, id: DownloadId, mut rx: watch::Receiver<Progress>) {
     let mut last_save = Instant::now();
+    // The starting state is what the store already holds (the resume
+    // segments, or nothing saved for a fresh start).
+    let mut last_saved = rx.borrow().durable_segments.clone();
     while rx.changed().await.is_ok() {
         let p = rx.borrow_and_update().clone();
         inner.emit(ManagerEvent::Progress {
@@ -787,9 +863,15 @@ async fn forward_progress(inner: Arc<Inner>, id: DownloadId, mut rx: watch::Rece
             eta_secs: p.eta_secs,
             segments: p.segments.iter().map(SegmentView::from).collect(),
         });
-        if p.status == Status::Downloading && last_save.elapsed() >= PERSIST_INTERVAL {
-            if let Err(e) = inner.store.save_segments(&id, &p.durable_segments) {
-                tracing::warn!(%id, error = %e, "saving progress failed");
+        if should_persist(
+            p.status,
+            last_save.elapsed(),
+            &p.durable_segments,
+            &last_saved,
+        ) {
+            match inner.store.save_segments(&id, &p.durable_segments) {
+                Ok(()) => last_saved = p.durable_segments,
+                Err(e) => tracing::warn!(%id, error = %e, "saving progress failed"),
             }
             last_save = Instant::now();
         }
@@ -809,5 +891,66 @@ mod tests {
         )));
         assert!(needs_fresh_start(&EngineError::InvalidResume("x".into())));
         assert!(needs_fresh_start(&EngineError::RangeNotSupported));
+    }
+
+    #[tokio::test]
+    async fn a_panicking_driver_becomes_an_internal_error() {
+        // Plan 2 backlog: a panic used to unwind past `finish()` and leak the
+        // queue slot forever. The guard turns it into an INTERNAL failure.
+        let r = guarded(async {
+            if "boom".len() == 4 {
+                panic!("boom");
+            }
+            Ok(())
+        })
+        .await;
+        let e = r.unwrap_err();
+        assert_eq!(e.code(), "INTERNAL");
+        assert!(e.to_string().contains("boom"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_guarded_driver_passes_its_result_through() {
+        assert!(guarded(async { Ok(()) }).await.is_ok());
+        let e = guarded(async { Err(CoreError::NotFound("x".into())) })
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), "NOT_FOUND");
+    }
+
+    #[test]
+    fn a_finished_files_length_is_read_or_left_unknown() {
+        // Plan 2 backlog: a metadata error after a successful download must
+        // not turn it into a FAILED one; the size just stays unknown.
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("f");
+        std::fs::write(&f, b"abc").unwrap();
+        assert_eq!(file_len(&f), Some(3));
+        assert_eq!(file_len(&d.path().join("missing")), None);
+    }
+
+    fn seg(downloaded: u64) -> SegmentState {
+        SegmentState {
+            idx: 0,
+            start: 0,
+            end: 99,
+            downloaded,
+        }
+    }
+
+    #[test]
+    fn progress_is_saved_only_when_the_durable_state_moved() {
+        // Plan 2 backlog: a stalled download must not rewrite the same
+        // snapshot every second.
+        let long = PERSIST_INTERVAL;
+        let short = PERSIST_INTERVAL / 2;
+        let d = Status::Downloading;
+        assert!(should_persist(d, long, &[seg(5)], &[seg(0)]));
+        assert!(!should_persist(d, long, &[seg(5)], &[seg(5)]), "unchanged");
+        assert!(!should_persist(d, short, &[seg(5)], &[seg(0)]), "too soon");
+        assert!(
+            !should_persist(Status::Paused, long, &[seg(5)], &[seg(0)]),
+            "a pause is saved by the driver from the outcome"
+        );
     }
 }

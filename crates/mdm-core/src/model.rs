@@ -159,6 +159,23 @@ pub struct ProbeInfo {
     pub mime: Option<String>,
 }
 
+/// What the add dialog shows before a download exists: the server's answer
+/// to a probe, without adding anything.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbePreview {
+    /// URL after redirects.
+    pub final_url: String,
+    /// The server's (sanitised) file name.
+    pub filename: String,
+    /// Total size when the server states it.
+    pub size: Option<u64>,
+    /// Size known and byte ranges honoured: segmented, pausable, resumable.
+    pub resumable: bool,
+    /// MIME type.
+    pub mime: Option<String>,
+}
+
 /// One download as stored and published.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

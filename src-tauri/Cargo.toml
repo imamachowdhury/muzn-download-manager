@@ -1,0 +1,44 @@
+[package]
+name = "mdm-app"
+description = "Muzn Download Manager desktop app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+name = "mdm_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mdm"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build.workspace = true
+# `tauri_build::build()` only embeds the Windows Common Controls v6 manifest
+# into `[[bin]]` targets, never `cargo test` binaries (see build.rs) — embed
+# it a second time for tests so the wiring test's binary can start at all.
+embed-resource = "3"
+
+[dependencies]
+mdm-core = { path = "../crates/mdm-core" }
+tauri.workspace = true
+tauri-plugin-single-instance.workspace = true
+tauri-plugin-dialog.workspace = true
+tauri-plugin-opener.workspace = true
+tauri-plugin-notification.workspace = true
+tauri-plugin-clipboard-manager.workspace = true
+tauri-plugin-autostart.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tauri = { workspace = true, features = ["test"] }

@@ -299,3 +299,16 @@ fn settings_are_clamped_and_checked() {
     let cfg = base.engine_config().unwrap();
     assert_eq!(cfg.max_connections, 8);
 }
+
+#[test]
+fn settings_saved_before_plan_3_get_the_new_switches_on() {
+    // Plan 3 (2026-09-19): close-to-tray and the completion notification
+    // default ON, also for settings stored before the fields existed.
+    let s = Store::open_in_memory().unwrap();
+    let old = r#"{"downloadDir":"/d","maxConnections":4,"maxParallel":2,"userAgent":null,"proxy":{"mode":"system"}}"#;
+    let parsed: Settings = serde_json::from_str(old).unwrap();
+    assert!(parsed.close_to_tray);
+    assert!(parsed.notify_on_complete);
+    s.save_settings(&parsed).unwrap();
+    assert_eq!(s.load_settings(Path::new("/x")).unwrap(), parsed);
+}
