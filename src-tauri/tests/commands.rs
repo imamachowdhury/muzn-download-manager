@@ -29,6 +29,18 @@ fn app(
     (app, webview)
 }
 
+// Tauri's ACL treats the page's request URL as "local" only when it matches how the
+// webview actually serves the app: `http://tauri.localhost` on Windows/Android (their
+// webviews can't route a custom `tauri://` scheme), `tauri://localhost` everywhere else.
+// Hard-coding the Windows form made Linux/macOS CI see a "remote" origin and refuse.
+fn app_url() -> url::Url {
+    if cfg!(windows) {
+        "http://tauri.localhost".parse().unwrap()
+    } else {
+        "tauri://localhost".parse().unwrap()
+    }
+}
+
 fn call(
     w: &tauri::WebviewWindow<tauri::test::MockRuntime>,
     cmd: &str,
@@ -40,7 +52,7 @@ fn call(
             cmd: cmd.into(),
             callback: CallbackFn(0),
             error: CallbackFn(1),
-            url: "http://tauri.localhost".parse().unwrap(),
+            url: app_url(),
             body: InvokeBody::Json(body),
             headers: Default::default(),
             invoke_key: INVOKE_KEY.to_string(),
