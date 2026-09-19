@@ -18,6 +18,10 @@ path = "src/main.rs"
 
 [build-dependencies]
 tauri-build.workspace = true
+# `tauri_build::build()` only embeds the Windows Common Controls v6 manifest
+# into `[[bin]]` targets, never `cargo test` binaries (see build.rs) — embed
+# it a second time for tests so the wiring test's binary can start at all.
+embed-resource = "3"
 
 [dependencies]
 mdm-core = { path = "../crates/mdm-core" }
@@ -37,3 +41,5 @@ url.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tauri = { workspace = true, features = ["test"] }
+tokio = { workspace = true, features = ["full"] }

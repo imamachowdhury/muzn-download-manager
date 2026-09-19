@@ -12,6 +12,33 @@ use tauri_plugin_opener::OpenerExt as _;
 
 use crate::api::{clipboard_link, completed_path, ApiError, ApiResult};
 
+/// Every command the window may call — the one list `run()` registers and the
+/// wiring test drives. Names and argument names are the UI's contract
+/// (src/api/tauri.ts).
+pub fn handler<R: Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static {
+    tauri::generate_handler![
+        list_downloads,
+        download_segments,
+        add_download,
+        probe_url,
+        pause_download,
+        resume_download,
+        cancel_download,
+        restart_download,
+        remove_download,
+        pause_all,
+        resume_all,
+        get_settings,
+        set_settings,
+        open_download,
+        show_download_in_folder,
+        pick_folder,
+        clipboard_url,
+        autostart_enabled,
+        set_autostart,
+    ]
+}
+
 fn row_of(m: &Manager, id: &DownloadId) -> ApiResult<DownloadRow> {
     m.get(id)?
         .ok_or_else(|| ApiError::new("NOT_FOUND", format!("not found: {id}")))

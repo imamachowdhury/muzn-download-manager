@@ -4,15 +4,20 @@ An open-source download manager: multi-connection segmented HTTP downloads with
 pause / resume, a browser extension that hands downloads to the app, and BitTorrent.
 One small desktop app for Windows, Linux and macOS (Tauri v2, Rust engine, React UI).
 
-**Status:** the download engine (`crates/mdm-engine`) and the download core (`crates/mdm-core`:
-SQLite store, queue, pause / resume / cancel, crash recovery) are complete and tested. The desktop
-app, browser extension and torrent support follow (see `docs/superpowers/`). Try the engine:
+**Status:** the download engine, the download core (SQLite store, queue, pause / resume /
+cancel, crash recovery) and the desktop app (download list with the segment map, add dialog
+with a live preview, detail panel, settings, tray, notifications) are complete and tested. The
+browser extension, torrent support and installers follow (see `docs/superpowers/`).
 
-    cargo run -p mdm-engine --example fetch -- https://example.com/big.iso
+## Build and run
 
-## Build
+Needs Rust (stable), Node 24 and pnpm; on Linux also WebKitGTK 4.1
+(`libwebkit2gtk-4.1-dev libxdo-dev libayatana-appindicator3-dev librsvg2-dev`).
 
-    cargo test --workspace
+    pnpm install
+    pnpm tauri dev
+
+Tests: `pnpm build && cargo test --workspace && pnpm test`. How the app is wired: `docs/APP.md`.
 
 ## License
 
