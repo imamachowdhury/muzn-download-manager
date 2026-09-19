@@ -103,3 +103,23 @@ test("a resync reloads the list", async () => {
   act(() => fake.resync());
   expect(await screen.findByText("new.bin")).toBeInTheDocument();
 });
+
+test("arrow keys scroll the moving selection into view", async () => {
+  // 40 rows is well past one 600px screen (≈12 rows at 48px) plus the
+  // virtualizer's 8-row overscan on each side.
+  const many = Array.from({ length: 40 }, (_, i) =>
+    fakeRow({ id: `r${i}`, filename: `f${i}.bin`, createdAt: i }),
+  );
+  const { user } = renderApp(undefined, many);
+  await screen.findAllByRole("option");
+  // Newest first: r39 (createdAt 39) is the topmost row.
+  await user.click(screen.getByText("f39.bin"));
+  (document.activeElement as HTMLElement | null)?.blur();
+  for (let i = 0; i < 30; i++) {
+    await user.keyboard("{ArrowDown}");
+  }
+  // 30 steps down from the top lands on r9 (createdAt 39 - 30), far past
+  // the first screen — it must still be selected AND actually rendered.
+  const selected = screen.getByRole("option", { name: "f9.bin" });
+  expect(selected).toHaveAttribute("aria-selected", "true");
+});

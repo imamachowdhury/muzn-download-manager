@@ -12,12 +12,6 @@ export default tseslint.config(
     plugins: { "react-hooks": reactHooks },
     rules: {
       ...reactHooks.configs.recommended.rules,
-      // This project runs no React Compiler (no babel-plugin-react-compiler anywhere in the
-      // toolchain — see vite.config.ts), so the "recommended" preset's compiler-diagnostics
-      // rule about @tanstack/react-virtual's useVirtualizer() not being safely memoizable by
-      // a compiler that never runs here is not applicable; it would otherwise fire on every
-      // use of the virtual list (src/components/DownloadList.tsx).
-      "react-hooks/incompatible-library": "off",
       "no-restricted-globals": ["error", "confirm", "alert", "prompt"],
       "no-restricted-properties": [
         "error",
@@ -25,6 +19,17 @@ export default tseslint.config(
         { object: "window", property: "alert" },
         { object: "window", property: "prompt" },
       ],
+    },
+  },
+  {
+    files: ["src/components/DownloadList.tsx"],
+    rules: {
+      // This project runs no React Compiler (no babel-plugin-react-compiler anywhere in the
+      // toolchain — see vite.config.ts), so the "recommended" preset's compiler-diagnostics
+      // rule about @tanstack/react-virtual's useVirtualizer() not being safely memoizable by
+      // a compiler that never runs here is not applicable; it fires on this file's use of
+      // the virtual list and nowhere else in the codebase.
+      "react-hooks/incompatible-library": "off",
     },
   },
 );

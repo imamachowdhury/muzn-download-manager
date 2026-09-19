@@ -1,5 +1,5 @@
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { useCallback, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 import type { DownloadRow } from "../api/types";
 import { useBackend, useDownloads, useDownloadsStore } from "../state/context";
 import { visibleRows } from "../state/downloads";
@@ -31,6 +31,15 @@ export function DownloadList() {
     },
     [backend],
   );
+
+  // The keyboard (ArrowUp/ArrowDown) can move the selection past what is
+  // currently rendered; keep the selected row scrolled into view so
+  // Space/Delete never act on a row the user cannot see.
+  useEffect(() => {
+    if (!selected) return;
+    const index = rows.findIndex((r) => r.id === selected);
+    if (index >= 0) virtual.scrollToIndex(index, { align: "auto" });
+  }, [selected, rows, virtual]);
 
   return (
     <div className="list">
