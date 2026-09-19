@@ -27,6 +27,9 @@ pub enum CoreError {
     /// A stored JSON column could not be read.
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    /// A bug: something that should never happen (a panicking task…).
+    #[error("internal error: {0}")]
+    Internal(String),
 }
 
 /// Result alias for the core.
@@ -44,6 +47,7 @@ impl CoreError {
             Self::Engine(e) => e.code(),
             Self::Io(_) => "IO",
             Self::Json(_) => "JSON",
+            Self::Internal(_) => "INTERNAL",
         }
     }
 }

@@ -17,6 +17,9 @@ its size once completed.
   manager keeps that runtime's handle and spawns every download on it, so every other method may be
   called from any thread, inside a runtime or not (Tauri's setup hook and sync commands).
 - **Queue:** FIFO by creation time, at most `max_parallel` (default 3) running.
+- **Probe without adding:** `probe(url, referrer)` asks the server about a URL and returns a
+  `ProbePreview` (final URL, file name, size, `resumable`, MIME) — the add dialog's live preview.
+  Same URL rules and engine error codes as `add`; nothing is stored.
 - **File names from callers** (`NewDownload.filename`) are sanitised on `add`
   (`mdm_engine::filename::sanitize`, and again by the engine): `../x`, `/abs/x` or `C:\x` can never
   write outside the download folder. A blank name means "use the probed one".
@@ -62,8 +65,10 @@ its size once completed.
 - **Durable progress:** the engine fsyncs the part file once a second while downloading, and once
   more at a pause or a failure, so `Outcome::Paused` / `Outcome::Failed` carry only the segments
   that survived that fsync — never bytes still sitting in the OS page cache. The manager saves that
-  durable snapshot to the store about once a second (`PERSIST_INTERVAL`), so a crash loses at most
-  a second or so of a running download's progress.
+  durable snapshot to the store at most once a second (`PERSIST_INTERVAL`), and only when it
+  changed, so a crash loses at most a second or so of a running download's progress.
+- **A panicking driver** fails its row with INTERNAL and frees its queue slot; it never leaks the
+  slot. A finished download whose size cannot be read afterwards stays COMPLETED with an unknown size.
 
 ## Events
 
