@@ -1,6 +1,7 @@
-import { act, screen, within } from "@testing-library/react";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import { expect, test } from "vitest";
-import { fakeRow } from "./api/fake";
+import { createFakeBackend, fakeRow } from "./api/fake";
+import type { DownloadRow } from "./api/types";
 import { renderApp } from "./test/render";
 
 const rows = [
@@ -122,4 +123,83 @@ test("arrow keys scroll the moving selection into view", async () => {
   // the first screen — it must still be selected AND actually rendered.
   const selected = screen.getByRole("option", { name: "f9.bin" });
   expect(selected).toHaveAttribute("aria-selected", "true");
+});
+
+// Final review I1 (2026-09-19): only a change of the selection scrolls the
+// list; another row's status update must not yank it back.
+test("an update to another row leaves the scroll position alone", async () => {
+  const many = Array.from({ length: 40 }, (_, i) =>
+    fakeRow({ id: `r${i}`, filename: `f${i}.bin`, createdAt: i, updatedAt: 1 }),
+  );
+  const { user, fake } = renderApp(undefined, many);
+  await screen.findAllByRole("option");
+  await user.click(screen.getByText("f39.bin")); // the topmost row
+  const list = screen.getByRole("listbox", { name: "Downloads" });
+  act(() => {
+    list.scrollTop = 1200;
+    list.dispatchEvent(new Event("scroll"));
+  });
+  act(() => fake.emit({ type: "updated", download: { ...many[5]!, status: "PAUSED", updatedAt: 2 } }));
+  act(() => fake.emit({ type: "updated", download: { ...many[39]!, status: "PROBING", updatedAt: 2 } }));
+  expect(list.scrollTop).toBe(1200);
+});
+
+// Final review M1 (2026-09-19): assistive tech follows the selection.
+test("the listbox points aria-activedescendant at the selected row", async () => {
+  const { user } = renderApp(undefined, rows);
+  const list = await screen.findByRole("listbox", { name: "Downloads" });
+  expect(list).not.toHaveAttribute("aria-activedescendant");
+  await user.click(screen.getByText("movie.mkv"));
+  const first = screen.getByRole("option", { name: "movie.mkv" });
+  expect(first.id).not.toBe("");
+  expect(list).toHaveAttribute("aria-activedescendant", first.id);
+  (document.activeElement as HTMLElement | null)?.blur();
+  await user.keyboard("{ArrowDown}");
+  expect(list).toHaveAttribute("aria-activedescendant", screen.getByRole("option", { name: "paused.iso" }).id);
+});
+
+test("the empty message is not an item of the listbox (final review M1)", async () => {
+  renderApp(undefined, []);
+  const empty = await screen.findByText("No downloads here. Press Ctrl+N to add one.");
+  expect(within(screen.getByRole("listbox", { name: "Downloads" })).queryByText(/No downloads here/)).toBeNull();
+  expect(empty).toBeInTheDocument();
+});
+
+// Final review M4 (2026-09-19): focus starts on "Keep", so Enter is safe.
+test("Enter in a remove confirmation keeps the download", async () => {
+  const { user, fake } = renderApp(undefined, rows);
+  await user.click(await screen.findByText("paused.iso"));
+  (document.activeElement as HTMLElement | null)?.blur();
+  await user.keyboard("{Delete}");
+  const dialog = await screen.findByRole("dialog", { name: "Remove download" });
+  expect(within(dialog).getByRole("button", { name: "Keep" })).toHaveFocus();
+  await user.keyboard("{Enter}");
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  expect(fake.calls.some((c) => c.startsWith("remove"))).toBe(false);
+  expect(screen.getByRole("option", { name: "paused.iso" })).toBeInTheDocument();
+});
+
+// Final review M5 (2026-09-19): a filter that hides the selection clears it.
+test("switching to a filter that hides the selected row clears the selection", async () => {
+  const { user, store } = renderApp(undefined, rows);
+  await user.click(await screen.findByText("movie.mkv"));
+  await user.click(screen.getByRole("button", { name: /Completed 1/ }));
+  expect(store.getState().selected).toBeNull();
+  expect(screen.getByText("Select a download to see its details.")).toBeInTheDocument();
+});
+
+// Final review I2 (2026-09-19): each reload is numbered; a slower, older reply loses.
+test("a late reply to an older list request is ignored", async () => {
+  const fake = createFakeBackend({ rows });
+  const replies: ((r: DownloadRow[]) => void)[] = [];
+  fake.list = () => new Promise<DownloadRow[]>((resolve) => replies.push(resolve));
+  renderApp(fake);
+  await waitFor(() => expect(replies).toHaveLength(1));
+  act(() => fake.resync());
+  expect(replies).toHaveLength(2);
+  const fresh = [...rows, fakeRow({ id: "n", filename: "new.bin", createdAt: 9 })];
+  await act(async () => replies[1]!(fresh));
+  expect(await screen.findByText("new.bin")).toBeInTheDocument();
+  await act(async () => replies[0]!(rows)); // the first request answers last, without "n"
+  expect(screen.getByText("new.bin")).toBeInTheDocument();
 });

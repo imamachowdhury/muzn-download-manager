@@ -1,11 +1,15 @@
 import { useEffect, useId, useState, type FormEvent } from "react";
 import type { ProxySetting, Settings } from "../api/types";
 import { describeError } from "../lib/errors";
+import { forgetDir } from "../lib/lastDir";
 import { useBackend } from "../state/context";
 import { Dialog } from "../ui/Dialog";
 import { toast } from "../ui/toast";
 
 const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, Math.round(n) || lo));
+
+/** A cleared number field holds NaN; the input shows it as empty, never "NaN" (final review M8). */
+const numberValue = (n: number): number | "" => (Number.isNaN(n) ? "" : n);
 
 /** UX clean-up before saving; the core validates again (its checks are the real ones). */
 export function clampSettings(s: Settings): Settings {
@@ -23,6 +27,7 @@ export function SettingsDialog({ onClose }: { onClose(): void }) {
   const backend = useBackend();
   const id = useId();
   const [form, setForm] = useState<Settings | null>(null);
+  const [initialDir, setInitialDir] = useState<string | null>(null);
   const [autostart, setAutostart] = useState<boolean | null>(null);
   const [initialAutostart, setInitialAutostart] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
@@ -31,7 +36,11 @@ export function SettingsDialog({ onClose }: { onClose(): void }) {
     let on = true;
     backend
       .getSettings()
-      .then((s) => on && setForm(s))
+      .then((s) => {
+        if (!on) return;
+        setForm(s);
+        setInitialDir(s.downloadDir);
+      })
       .catch((e: unknown) => toast(describeError(e), "error"));
     backend
       .autostartEnabled()
@@ -54,7 +63,9 @@ export function SettingsDialog({ onClose }: { onClose(): void }) {
     if (!form || proxyUrlMissing) return;
     setBusy(true);
     try {
-      await backend.setSettings(clampSettings(form));
+      const saved = await backend.setSettings(clampSettings(form));
+      // A newly chosen download folder beats the add dialog's remembered one.
+      if (saved.downloadDir !== initialDir) forgetDir();
       if (autostart !== null && autostart !== initialAutostart) await backend.setAutostart(autostart);
       toast("Settings saved", "ok");
       onClose();
@@ -113,7 +124,7 @@ export function SettingsDialog({ onClose }: { onClose(): void }) {
                 type="number"
                 min={1}
                 max={32}
-                value={form.maxConnections}
+                value={numberValue(form.maxConnections)}
                 onChange={(e) => set("maxConnections", e.target.valueAsNumber)}
               />
             </label>
@@ -124,7 +135,7 @@ export function SettingsDialog({ onClose }: { onClose(): void }) {
                 type="number"
                 min={1}
                 max={10}
-                value={form.maxParallel}
+                value={numberValue(form.maxParallel)}
                 onChange={(e) => set("maxParallel", e.target.valueAsNumber)}
               />
             </label>

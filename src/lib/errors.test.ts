@@ -3,10 +3,15 @@ import { describeError, errorText, rowErrorText } from "./errors";
 import { fakeRow } from "../api/fake";
 
 test("known codes read as plain English", () => {
-  expect(errorText("SOURCE_CHANGED")).toBe(
-    "The file on the server changed. Restart from the beginning?",
-  );
+  // Final review M2 (2026-09-19): the sentence no longer asks the question the
+  // "Restart from the beginning" link beside it already asks.
+  expect(errorText("SOURCE_CHANGED")).toBe("The file on the server changed.");
   expect(errorText("DISK_FULL")).toContain("disk space");
+});
+
+test("every stable code the core can send has words (final review M6)", () => {
+  expect(errorText("CANCELLED", "cancelled")).toBe("The download was cancelled.");
+  expect(errorText("JSON", "expected value at line 1")).toBe("Saved data could not be read.");
 });
 
 test("an unknown code falls back to the detail, then a generic line", () => {

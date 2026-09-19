@@ -42,13 +42,13 @@ export function ConfirmHost() {
       width={420}
       footer={
         <>
-          <button type="button" className="secondary-button" onClick={() => close(false)}>
+          {/* Focus starts on the safe choice: Enter never destroys anything (final review M4). */}
+          <button type="button" className="secondary-button" data-autofocus onClick={() => close(false)}>
             Keep
           </button>
           <button
             type="button"
             className={req.danger ? "danger-button" : "primary-button"}
-            data-autofocus
             onClick={() => close(true)}
           >
             {req.confirmLabel}

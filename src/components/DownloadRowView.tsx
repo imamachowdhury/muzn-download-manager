@@ -17,6 +17,8 @@ export const STATUS_LABEL: Record<DownloadRow["status"], string> = {
 };
 
 interface Props {
+  /** Stable DOM id (the listbox's aria-activedescendant). */
+  domId: string;
   row: DownloadRow;
   live: Live | undefined;
   selected: boolean;
@@ -25,13 +27,14 @@ interface Props {
   style: CSSProperties;
 }
 
-export const DownloadRowView = memo(function DownloadRowView({ row, live, selected, onSelect, onOpen, style }: Props) {
+export const DownloadRowView = memo(function DownloadRowView({ domId, row, live, selected, onSelect, onOpen, style }: Props) {
   const total = live?.total ?? row.size;
   const downloaded = live?.downloaded ?? row.downloaded;
   const pct = row.status === "COMPLETED" ? 100 : percent(downloaded, total);
   const name = displayName(row);
   return (
     <div
+      id={domId}
       role="option"
       aria-selected={selected}
       aria-label={name}

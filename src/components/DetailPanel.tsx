@@ -8,6 +8,7 @@ import {
   cancelWithConfirm,
   displayName,
   removeWithConfirm,
+  restartWithConfirm,
   savedPath,
   toggle,
 } from "../lib/actions";
@@ -79,7 +80,7 @@ function DetailBody({ row, live }: { row: DownloadRow; live: Live | undefined })
           </button>
         )}
         {canRestart(row) && row.errorCode !== "SOURCE_CHANGED" && (
-          <button type="button" className="secondary-button" onClick={() => void attempt(backend.restart(row.id))}>
+          <button type="button" className="secondary-button" onClick={() => void restartWithConfirm(backend, row)}>
             Restart
           </button>
         )}

@@ -16,3 +16,15 @@ export function rememberDir(dir: string): void {
     // storage unavailable: nothing to remember
   }
 }
+
+/**
+ * Forget the remembered folder: Settings saved a new download folder, and
+ * that choice must win from now on (final review M7).
+ */
+export function forgetDir(): void {
+  try {
+    localStorage.removeItem(KEY);
+  } catch {
+    // storage unavailable: nothing was remembered
+  }
+}

@@ -1,5 +1,5 @@
 import { screen, within } from "@testing-library/react";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { createFakeBackend, fakeSettings } from "../api/fake";
 import { renderApp } from "../test/render";
 import { clampSettings } from "./SettingsDialog";
@@ -73,4 +73,48 @@ test("the download folder is chosen through the OS dialog", async () => {
   await within(dialog).findByLabelText("Download folder");
   await user.click(within(dialog).getByRole("button", { name: "Browse…" }));
   expect(within(dialog).getByLabelText("Download folder")).toHaveValue("/picked");
+});
+
+test("a cleared number becomes the minimum when saved (final review M8)", () => {
+  const s = clampSettings(fakeSettings({ maxConnections: Number.NaN, maxParallel: Number.NaN }));
+  expect(s).toMatchObject({ maxConnections: 1, maxParallel: 1 });
+});
+
+test("a cleared number field shows empty, without React's NaN warning (final review M8)", async () => {
+  const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    const { user } = renderApp();
+    const dialog = await openSettings(user);
+    const conns = await within(dialog).findByLabelText("Connections per download");
+    await user.clear(conns);
+    expect(conns).toHaveValue(null);
+    expect(conns.getAttribute("value")).not.toBe("NaN");
+    expect(errors.mock.calls.some((c) => String(c[0]).includes("NaN"))).toBe(false);
+  } finally {
+    errors.mockRestore();
+  }
+});
+
+// Final review M7 (2026-09-19): the add dialog's remembered folder must not
+// outlive a download folder chosen in Settings.
+test("saving a new download folder forgets the add dialog's last folder", async () => {
+  localStorage.setItem("mdm.lastDir", "/elsewhere");
+  const fake = createFakeBackend();
+  const { user } = renderApp(fake);
+  const dialog = await openSettings(user);
+  await within(dialog).findByLabelText("Download folder");
+  await user.click(within(dialog).getByRole("button", { name: "Browse…" }));
+  await user.click(within(dialog).getByRole("button", { name: "Save" }));
+  expect(fake.settings.downloadDir).toBe("/picked");
+  expect(localStorage.getItem("mdm.lastDir")).toBeNull();
+});
+
+test("saving without changing the folder keeps the add dialog's last folder", async () => {
+  localStorage.setItem("mdm.lastDir", "/elsewhere");
+  const { user } = renderApp();
+  const dialog = await openSettings(user);
+  await within(dialog).findByLabelText("Download folder");
+  await user.click(within(dialog).getByRole("button", { name: "Save" }));
+  expect(localStorage.getItem("mdm.lastDir")).toBe("/elsewhere");
+  localStorage.removeItem("mdm.lastDir");
 });

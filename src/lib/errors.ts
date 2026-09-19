@@ -2,7 +2,10 @@ import { isApiError, type DownloadRow } from "../api/types";
 
 // The one place stable error codes become words (Global Constraints).
 const MESSAGES: Record<string, string> = {
-  SOURCE_CHANGED: "The file on the server changed. Restart from the beginning?",
+  // The detail panel puts a "Restart from the beginning" link right beside it.
+  SOURCE_CHANGED: "The file on the server changed.",
+  CANCELLED: "The download was cancelled.",
+  JSON: "Saved data could not be read.",
   HTTP_STATUS: "The server refused the download — the link may have expired.",
   NETWORK: "Network problem. Check the connection and resume.",
   TLS: "The secure connection failed.",

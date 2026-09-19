@@ -32,11 +32,43 @@ test("a changed file explains itself and restarts on request", async () => {
     fakeRow({ id: "f", filename: "setup.exe", status: "FAILED", errorCode: "SOURCE_CHANGED", errorMessage: "etag" }),
   ]);
   await user.click(await screen.findByText("setup.exe", { selector: "[data-testid=name]" }));
+  // Final review M2 (2026-09-19): the sentence is now exactly this, the link beside it asks.
   expect(within(panel()).getByRole("alert")).toHaveTextContent(
-    "The file on the server changed. Restart from the beginning?",
+    /^The file on the server changed\. Restart from the beginning$/,
   );
+  // Resuming would only fail again (M3): no Resume in the panel or the toolbar.
+  expect(within(panel()).queryByRole("button", { name: "Resume" })).not.toBeInTheDocument();
+  expect(within(screen.getByRole("toolbar", { name: "Actions" })).getByRole("button", { name: "Resume" })).toBeDisabled();
+  // The link restarts at once: the saved data is already invalid, nothing to confirm (I3).
   await user.click(within(panel()).getByRole("button", { name: "Restart from the beginning" }));
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   expect(fake.calls).toContain("restart f");
+});
+
+test("Space does not resume a SOURCE_CHANGED row (final review M3)", async () => {
+  const { user, fake } = renderApp(undefined, [
+    fakeRow({ id: "f", filename: "setup.exe", status: "FAILED", errorCode: "SOURCE_CHANGED" }),
+  ]);
+  await user.click(await screen.findByText("setup.exe", { selector: "[data-testid=name]" }));
+  (document.activeElement as HTMLElement | null)?.blur();
+  await user.keyboard(" ");
+  expect(fake.calls.some((c) => c.startsWith("resume"))).toBe(false);
+});
+
+test("Restart asks first, because it deletes the downloaded part (final review I3)", async () => {
+  const { user, fake } = renderApp(undefined, [
+    fakeRow({ id: "p", filename: "paused.iso", status: "PAUSED", downloaded: 400 }),
+  ]);
+  await user.click(await screen.findByText("paused.iso", { selector: "[data-testid=name]" }));
+  await user.click(within(panel()).getByRole("button", { name: "Restart" }));
+  let dialog = await screen.findByRole("dialog", { name: "Restart download" });
+  expect(dialog).toHaveTextContent("The downloaded part is deleted.");
+  await user.click(within(dialog).getByRole("button", { name: "Keep" }));
+  expect(fake.calls).not.toContain("restart p");
+  await user.click(within(panel()).getByRole("button", { name: "Restart" }));
+  dialog = await screen.findByRole("dialog", { name: "Restart download" });
+  await user.click(within(dialog).getByRole("button", { name: "Restart" }));
+  expect(fake.calls).toContain("restart p");
 });
 
 test("a paused download shows its saved segments; a running one its live segments", async () => {

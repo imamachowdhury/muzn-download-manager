@@ -23,7 +23,10 @@ export function savedPath(row: DownloadRow): string {
 }
 
 export const canPause = (r: DownloadRow) => ["QUEUED", "PROBING", "DOWNLOADING"].includes(r.status);
-export const canResume = (r: DownloadRow) => ["PAUSED", "FAILED", "CANCELLED"].includes(r.status);
+// A SOURCE_CHANGED row would only fail again on resume: the saved part belongs
+// to the old file. Its way on is "Restart from the beginning" (final review M3).
+export const canResume = (r: DownloadRow) =>
+  ["PAUSED", "FAILED", "CANCELLED"].includes(r.status) && r.errorCode !== "SOURCE_CHANGED";
 export const canRestart = (r: DownloadRow) => ["PAUSED", "FAILED", "CANCELLED"].includes(r.status);
 export const canCancel = (r: DownloadRow) => !["COMPLETED", "CANCELLED"].includes(r.status);
 
@@ -55,4 +58,15 @@ export async function cancelWithConfirm(backend: Backend, row: DownloadRow): Pro
     danger: true,
   });
   if (answer.ok) await attempt(backend.cancel(row.id));
+}
+
+/** Restart throws the downloaded part away, so it asks first (final review I3). */
+export async function restartWithConfirm(backend: Backend, row: DownloadRow): Promise<void> {
+  const answer = await confirmDialog({
+    title: "Restart download",
+    message: `Restart "${displayName(row)}" from the beginning? The downloaded part is deleted.`,
+    confirmLabel: "Restart",
+    danger: true,
+  });
+  if (answer.ok) await attempt(backend.restart(row.id));
 }

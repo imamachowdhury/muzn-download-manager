@@ -18,6 +18,13 @@ test("which action fits which status", () => {
   expect(canCancel(s({ status: "CANCELLED" }))).toBe(false);
 });
 
+test("a SOURCE_CHANGED row cannot resume, only restart (final review M3)", () => {
+  const changed = fakeRow({ status: "FAILED", errorCode: "SOURCE_CHANGED" });
+  expect(canResume(changed)).toBe(false);
+  expect(canRestart(changed)).toBe(true);
+  expect(canResume(fakeRow({ status: "FAILED", errorCode: "NETWORK" }))).toBe(true);
+});
+
 test("a row's name and where it is saved", () => {
   expect(displayName(fakeRow({ filename: "a.zip" }))).toBe("a.zip");
   expect(displayName(fakeRow({ filename: null, url: "https://x.com/dir/b.iso?x=1" }))).toBe("b.iso");

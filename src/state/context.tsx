@@ -41,13 +41,17 @@ export function useManagerSync(onNotice: (message: string) => void): void {
   useEffect(() => {
     let cancelled = false;
     let off: (() => void) | undefined;
-    const reload = () =>
-      backend
+    // Each request is numbered; the store ignores a reply older than the
+    // latest request, and events since the request win over its snapshot.
+    const reload = () => {
+      const seq = store.getState().beginLoad();
+      return backend
         .list()
         .then((rows) => {
-          if (!cancelled) store.getState().load(rows);
+          if (!cancelled) store.getState().load(rows, seq);
         })
         .catch((e: unknown) => onNotice(describeError(e)));
+    };
     backend
       .subscribe(
         (e) => {
