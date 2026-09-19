@@ -128,3 +128,16 @@ button, input, select { font: inherit; color: inherit; }
   .rail { width: 136px; }
   .topbar .brand { display: none; }
 }
+
+.detail { flex: none; height: 230px; overflow: auto; border-top: 1px solid var(--border); background: var(--surface); padding: 10px 12px; }
+.detail-empty { display: grid; place-items: center; color: var(--text-muted); }
+.detail-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.detail-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40%; }
+.detail-error { margin: 0 0 8px; color: var(--danger); }
+.facts { display: grid; grid-template-columns: 90px 1fr; gap: 2px 12px; margin: 0 0 8px; }
+.facts dt { color: var(--text-muted); }
+.facts dd { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.segments { border-collapse: collapse; font-size: 12px; }
+.segments th, .segments td { padding: 2px 12px 2px 0; text-align: left; }
+.segments th { color: var(--text-muted); font-weight: 500; }
+@media (max-width: 1000px) { .detail { height: 200px; } .detail-name { max-width: 100%; } }

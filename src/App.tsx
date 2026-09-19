@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { removeWithConfirm, toggle } from "./lib/actions";
 import { shortcutFor, step } from "./lib/keys";
 import { AddDialog } from "./components/AddDialog";
+import { DetailPanel } from "./components/DetailPanel";
 import { DownloadList } from "./components/DownloadList";
 import { FilterRail } from "./components/FilterRail";
 import { TopBar } from "./components/TopBar";
@@ -56,6 +57,7 @@ export function App() {
         <FilterRail />
         <div className="content">
           <DownloadList />
+          <DetailPanel />
         </div>
       </div>
       {/* Task 9 renders the settings dialog while `settingsOpen`. */}

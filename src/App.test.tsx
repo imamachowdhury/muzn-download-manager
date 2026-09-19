@@ -33,7 +33,7 @@ test("select a row, then pause and resume it from the toolbar and with Space", a
   const { user, fake } = renderApp(undefined, rows);
   await user.click(await screen.findByText("movie.mkv"));
   expect(screen.getByRole("option", { name: /movie\.mkv/ })).toHaveAttribute("aria-selected", "true");
-  await user.click(screen.getByRole("button", { name: "Pause" }));
+  await user.click(within(screen.getByRole("toolbar", { name: "Actions" })).getByRole("button", { name: "Pause" }));
   expect(fake.calls).toContain("pause d");
   await within(screen.getByRole("option", { name: /movie\.mkv/ })).findByText("Paused");
   (document.activeElement as HTMLElement | null)?.blur();
