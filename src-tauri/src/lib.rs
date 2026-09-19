@@ -1,6 +1,10 @@
 //! Muzn Download Manager — the desktop app: Tauri commands and events over `mdm-core`.
 
+mod api;
+mod commands;
+mod events;
 mod paths;
+mod tray;
 mod window;
 
 use std::time::Duration;
@@ -38,8 +42,40 @@ pub fn run() {
                 mdm_core::Manager::open(&paths.db, &paths.download_dir)
             })?;
             app.manage(manager);
+            let manager = app.state::<mdm_core::Manager>().inner().clone();
+            events::spawn_forwarder(app.handle().clone(), manager);
+            let has_tray = match tray::build(app) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!(error = %e, "no tray icon; the close button will quit");
+                    false
+                }
+            };
+            app.manage(tray::TrayState(has_tray));
             Ok(())
         })
+        .on_window_event(window::on_window_event)
+        .invoke_handler(tauri::generate_handler![
+            commands::list_downloads,
+            commands::download_segments,
+            commands::add_download,
+            commands::probe_url,
+            commands::pause_download,
+            commands::resume_download,
+            commands::cancel_download,
+            commands::restart_download,
+            commands::remove_download,
+            commands::pause_all,
+            commands::resume_all,
+            commands::get_settings,
+            commands::set_settings,
+            commands::open_download,
+            commands::show_download_in_folder,
+            commands::pick_folder,
+            commands::clipboard_url,
+            commands::autostart_enabled,
+            commands::set_autostart,
+        ])
         .build(tauri::generate_context!())
         .expect("building the Muzn Download Manager window failed");
     app.run(|app, event| {
