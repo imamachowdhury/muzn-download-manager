@@ -17,12 +17,39 @@ use crate::file::PartFile;
 use crate::plan::SegmentState;
 use crate::request::RequestExtras;
 
-/// Attempts per segment before the download fails.
+/// Attempts in a row without progress before the segment fails.
 pub const RETRY_MAX_ATTEMPTS: u32 = 10;
 /// Longest backoff between attempts.
 pub const RETRY_CAP: Duration = Duration::from_secs(60);
 /// `end` of a single-stream segment until the stream tells us.
 pub const UNKNOWN_END: u64 = u64::MAX;
+
+/// The owner's retry rule (2026-09-18, "progress holei retry reset koro"):
+/// only attempts in a row that wrote nothing count; a progressing attempt
+/// resets the count and the backoff.
+#[derive(Debug, Default)]
+pub(crate) struct RetryBudget {
+    no_progress: u32,
+}
+
+impl RetryBudget {
+    /// A transient failure happened after writing `wrote` bytes. Returns the
+    /// delay before the next attempt, or `None` when the budget is spent.
+    pub(crate) fn on_failure(&mut self, wrote: u64, base: Duration) -> Option<Duration> {
+        if wrote > 0 {
+            self.no_progress = 0;
+            return Some(base.min(RETRY_CAP));
+        }
+        self.no_progress += 1;
+        if self.no_progress >= RETRY_MAX_ATTEMPTS {
+            return None;
+        }
+        Some(
+            base.saturating_mul(1 << (self.no_progress - 1).min(20))
+                .min(RETRY_CAP),
+        )
+    }
+}
 
 /// Live counters for one segment, shared between the worker, the progress
 /// ticker and the work stealer.
@@ -110,31 +137,30 @@ pub struct SegmentJob {
 /// [`EngineError::Cancelled`]. A single stream (`ranged == false`) always
 /// answers from byte 0, so every attempt restarts it from the beginning.
 pub async fn fetch_segment(job: SegmentJob) -> Result<(), EngineError> {
-    let mut attempt: u32 = 0;
+    let mut budget = RetryBudget::default();
     loop {
         if job.cancel.is_cancelled() {
             return Err(EngineError::Cancelled);
         }
-        match attempt_once(&job).await {
+        let mut wrote = 0u64;
+        match attempt_once(&job, &mut wrote).await {
             Ok(()) => return Ok(()),
-            Err(e) if e.is_transient() && attempt + 1 < RETRY_MAX_ATTEMPTS => {
-                attempt += 1;
-                let delay = job
-                    .retry_base_delay
-                    .saturating_mul(1 << (attempt - 1).min(20))
-                    .min(RETRY_CAP);
-                tracing::debug!(idx = job.seg.idx, attempt, ?delay, error = %e, "segment retry");
-                tokio::select! {
-                    _ = job.cancel.cancelled() => return Err(EngineError::Cancelled),
-                    _ = tokio::time::sleep(delay) => {}
+            Err(e) if e.is_transient() => match budget.on_failure(wrote, job.retry_base_delay) {
+                None => return Err(e),
+                Some(delay) => {
+                    tracing::debug!(idx = job.seg.idx, wrote, ?delay, error = %e, "segment retry");
+                    tokio::select! {
+                        _ = job.cancel.cancelled() => return Err(EngineError::Cancelled),
+                        _ = tokio::time::sleep(delay) => {}
+                    }
                 }
-            }
+            },
             Err(e) => return Err(e),
         }
     }
 }
 
-async fn attempt_once(job: &SegmentJob) -> Result<(), EngineError> {
+async fn attempt_once(job: &SegmentJob, wrote: &mut u64) -> Result<(), EngineError> {
     let seg = &job.seg;
     let next = if job.ranged {
         seg.next_offset()
@@ -188,9 +214,16 @@ async fn attempt_once(job: &SegmentJob) -> Result<(), EngineError> {
                     .parse::<u64>()
                     .ok()
             });
-        if starts_at != Some(next) {
+        let starts_at = match starts_at {
+            // A 206 with no usable Content-Range cannot be trusted to answer
+            // ranges at all, however it phrased the status: fail once, not
+            // after ten retries of the same lie.
+            None => return Err(EngineError::RangeNotSupported),
+            Some(s) => s,
+        };
+        if starts_at != next {
             return Err(EngineError::Network(format!(
-                "Content-Range starts at {starts_at:?}, wanted {next}"
+                "Content-Range starts at {starts_at}, wanted {next}"
             )));
         }
     } else if !status.is_success() {
@@ -222,8 +255,18 @@ async fn attempt_once(job: &SegmentJob) -> Result<(), EngineError> {
         if buf.is_empty() {
             break; // the range was shrunk under us; what we have is enough
         }
-        job.file.write_at(pos, buf).map_err(EngineError::from_io)?;
-        pos += buf.len() as u64;
+        // Disk I/O leaves the async threads: hand an owned prefix of the
+        // chunk (`buf` is always `&chunk[..len]`) to a blocking thread.
+        let len = buf.len();
+        let data = chunk.slice(..len);
+        let file = job.file.clone();
+        tokio::task::spawn_blocking(move || file.write_at(pos, &data))
+            .await
+            .map_err(|e| EngineError::Internal(format!("write task: {e}")))?
+            .map_err(EngineError::from_io)?;
+        // Only a write that returned Ok counts toward the retry rule.
+        pos += len as u64;
+        *wrote += len as u64;
         seg.downloaded.store(pos - seg.start, Ordering::SeqCst);
         if end != UNKNOWN_END && pos > end {
             break;
@@ -231,8 +274,14 @@ async fn attempt_once(job: &SegmentJob) -> Result<(), EngineError> {
     }
     let end = seg.end.load(Ordering::SeqCst);
     if end == UNKNOWN_END {
-        seg.end
-            .store(pos.saturating_sub(1).max(seg.start), Ordering::SeqCst);
+        // A single stream that ended having written nothing this attempt
+        // (an empty file, or a retry that reconnected but got no bytes
+        // before the server closed again) leaves `end` unknown rather than
+        // claiming byte `start` exists: the snapshot of a truly empty
+        // stream must be `downloaded: 0`, not a phantom 1-byte file.
+        if pos > seg.start {
+            seg.end.store(pos - 1, Ordering::SeqCst);
+        }
         return Ok(());
     }
     if pos <= end {
@@ -241,4 +290,55 @@ async fn attempt_once(job: &SegmentJob) -> Result<(), EngineError> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ten_failures_without_progress_spend_the_budget() {
+        let mut b = RetryBudget::default();
+        let base = Duration::from_secs(1);
+        for i in 1..10 {
+            assert!(b.on_failure(0, base).is_some(), "failure {i} still retries");
+        }
+        assert_eq!(b.on_failure(0, base), None, "the 10th failure gives up");
+    }
+
+    #[test]
+    fn progress_resets_the_count_and_the_backoff() {
+        // Review finding 2026-09-19: the progressing attempt must not count.
+        let mut b = RetryBudget::default();
+        let base = Duration::from_secs(1);
+        for _ in 0..9 {
+            b.on_failure(0, base).unwrap();
+        }
+        assert_eq!(
+            b.on_failure(1, base),
+            Some(base),
+            "progress: base delay again"
+        );
+        for i in 1..10 {
+            assert!(
+                b.on_failure(0, base).is_some(),
+                "failure {i} after progress still retries"
+            );
+        }
+        assert_eq!(
+            b.on_failure(0, base),
+            None,
+            "the 10th in a row after progress gives up"
+        );
+    }
+
+    #[test]
+    fn backoff_doubles_and_caps() {
+        let mut b = RetryBudget::default();
+        let base = Duration::from_secs(1);
+        let delays: Vec<u64> = (0..9)
+            .map(|_| b.on_failure(0, base).unwrap().as_secs())
+            .collect();
+        assert_eq!(delays, vec![1, 2, 4, 8, 16, 32, 60, 60, 60]);
+    }
 }

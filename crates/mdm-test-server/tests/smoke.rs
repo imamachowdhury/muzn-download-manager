@@ -1,6 +1,4 @@
-mod support;
-
-use support::*;
+use mdm_test_server::*;
 
 #[tokio::test]
 async fn serves_full_file_and_ranges() {

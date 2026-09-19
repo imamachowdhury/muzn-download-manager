@@ -1,12 +1,10 @@
-mod support;
-
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
 use mdm_engine::segment::{fetch_segment, SegmentJob, SegmentRuntime};
 use mdm_engine::{EngineError, PartFile, RequestExtras};
-use support::*;
+use mdm_test_server::*;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
@@ -98,21 +96,39 @@ async fn retries_after_connection_drop_and_503() {
     let (j, file) = job(&s, d.path(), seg, true);
     fetch_segment(j).await.unwrap();
     assert_eq!(sha256_file(file.part_path()), sha256_bytes(&s.data));
-    assert!(
-        s.cfg.requests.load(Ordering::SeqCst) >= 6,
+    assert_eq!(
+        s.cfg.requests.load(Ordering::SeqCst),
+        6,
         "2 x 503 + 4 partial bodies"
     );
 }
 
 #[tokio::test]
+async fn a_link_that_drops_every_50_kb_still_completes() {
+    // Owner decision 2026-09-18 ("progress holei retry reset koro"): an attempt
+    // that wrote bytes resets the retry budget, so forty drops do not fail a
+    // segment that keeps moving forward.
+    let s = TestServer::start(2_000_000).await;
+    s.cfg.drop_after.store(50_000, Ordering::SeqCst);
+    let d = tempfile::tempdir().unwrap();
+    let seg = Arc::new(SegmentRuntime::new(0, 0, Some(1_999_999), 0));
+    let (j, file) = job(&s, d.path(), seg, true);
+    fetch_segment(j).await.unwrap();
+    assert_eq!(sha256_file(file.part_path()), sha256_bytes(&s.data));
+    assert!(s.cfg.requests.load(Ordering::SeqCst) >= 40);
+}
+
+#[tokio::test]
 async fn gives_up_after_max_attempts() {
+    // Since 2026-09-18 the budget counts attempts WITHOUT progress: 503s write
+    // nothing, so ten of them in a row fail the segment.
     let s = TestServer::start(200_000).await;
-    s.cfg.drop_after.store(10, Ordering::SeqCst); // 20 000 attempts would be needed
+    s.cfg.fail_first.store(1000, Ordering::SeqCst);
     let d = tempfile::tempdir().unwrap();
     let seg = Arc::new(SegmentRuntime::new(0, 0, Some(199_999), 0));
     let (j, _) = job(&s, d.path(), seg, true);
     let e = fetch_segment(j).await.unwrap_err();
-    assert_eq!(e.code(), "NETWORK");
+    assert_eq!(e.code(), "HTTP_STATUS");
     assert_eq!(s.cfg.requests.load(Ordering::SeqCst), 10);
 }
 
@@ -138,6 +154,20 @@ async fn range_ignored_by_server_is_range_not_supported() {
         fetch_segment(j).await.unwrap_err().code(),
         "RANGE_NOT_SUPPORTED"
     );
+}
+
+#[tokio::test]
+async fn a_206_without_content_range_is_range_not_supported_at_once() {
+    let s = TestServer::start(10_000).await;
+    s.cfg.omit_content_range.store(true, Ordering::SeqCst);
+    let d = tempfile::tempdir().unwrap();
+    let seg = Arc::new(SegmentRuntime::new(0, 100, Some(199), 0));
+    let (j, _) = job(&s, d.path(), seg, true);
+    assert_eq!(
+        fetch_segment(j).await.unwrap_err().code(),
+        "RANGE_NOT_SUPPORTED"
+    );
+    assert_eq!(s.cfg.requests.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

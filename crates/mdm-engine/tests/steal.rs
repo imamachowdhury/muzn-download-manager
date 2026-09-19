@@ -1,12 +1,10 @@
-mod support;
-
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use mdm_engine::{
     DownloadSpec, Engine, EngineConfig, Outcome, PartFile, RequestExtras, Resume, SegmentState,
 };
-use support::*;
+use mdm_test_server::*;
 use url::Url;
 
 const MIB: u64 = 1024 * 1024;
@@ -51,6 +49,8 @@ async fn a_finished_worker_takes_half_of_the_largest_remaining_range() {
                 etag: Some("\"v1\"".into()),
                 last_modified: Some("Thu, 18 Sep 2026 10:00:00 GMT".into()),
             }),
+            reserved: Vec::new(),
+            single_stream: false,
         })
         .await
         .unwrap();
@@ -91,6 +91,8 @@ async fn nothing_is_stolen_when_less_than_two_mib_remain() {
             filename: None,
             extras: RequestExtras::default(),
             resume_from: None,
+            reserved: Vec::new(),
+            single_stream: false,
         })
         .await
         .unwrap();

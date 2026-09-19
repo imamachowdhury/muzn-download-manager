@@ -1,5 +1,8 @@
 //! The engine: one shared HTTP client and its settings.
 
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::error::EngineError;
@@ -52,26 +55,30 @@ pub struct Engine {
     pub(crate) client: reqwest::Client,
     /// The engine configuration.
     pub(crate) cfg: EngineConfig,
+    /// Part file paths claimed by a currently-running download, shared by
+    /// every clone. `Engine::start` uses this so two live downloads of the
+    /// same name never write into one `.mdm.part`.
+    pub(crate) live_parts: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 impl Engine {
     /// Build the shared client.
     pub fn new(cfg: EngineConfig) -> Result<Engine, EngineError> {
-        let mut b = reqwest::Client::builder()
-            .user_agent(cfg.user_agent.clone())
-            .connect_timeout(cfg.connect_timeout)
-            .redirect(reqwest::redirect::Policy::limited(10))
-            .no_gzip()
-            .no_brotli()
-            .no_deflate();
-        b = match &cfg.proxy {
-            Proxy::System => b,
-            Proxy::None => b.no_proxy(),
-            Proxy::Manual(u) => b.proxy(reqwest::Proxy::all(u.as_str())?),
-        };
         Ok(Engine {
-            client: b.build()?,
+            client: build_client(&cfg)?,
             cfg,
+            live_parts: Arc::new(Mutex::new(HashSet::new())),
+        })
+    }
+
+    /// A new engine with `cfg` that shares this engine's registry of live
+    /// part files, so downloads started before a settings change keep their
+    /// claims.
+    pub fn reconfigured(&self, cfg: EngineConfig) -> Result<Engine, EngineError> {
+        Ok(Engine {
+            client: build_client(&cfg)?,
+            cfg,
+            live_parts: self.live_parts.clone(),
         })
     }
 
@@ -79,6 +86,23 @@ impl Engine {
     pub fn config(&self) -> &EngineConfig {
         &self.cfg
     }
+}
+
+/// The one HTTP client recipe, shared by `new` and `reconfigured`.
+fn build_client(cfg: &EngineConfig) -> Result<reqwest::Client, EngineError> {
+    let mut b = reqwest::Client::builder()
+        .user_agent(cfg.user_agent.clone())
+        .connect_timeout(cfg.connect_timeout)
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .no_gzip()
+        .no_brotli()
+        .no_deflate();
+    b = match &cfg.proxy {
+        Proxy::System => b,
+        Proxy::None => b.no_proxy(),
+        Proxy::Manual(u) => b.proxy(reqwest::Proxy::all(u.as_str())?),
+    };
+    Ok(b.build()?)
 }
 
 #[cfg(test)]

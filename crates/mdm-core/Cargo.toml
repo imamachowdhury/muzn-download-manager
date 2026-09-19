@@ -1,6 +1,6 @@
 [package]
-name = "mdm-engine"
-description = "Segmented HTTP download engine for Muzn Download Manager"
+name = "mdm-core"
+description = "Download store and manager for Muzn Download Manager"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,19 +8,18 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-tokio.workspace = true
+mdm-engine = { path = "../mdm-engine" }
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 tokio-util.workspace = true
-reqwest.workspace = true
-futures-util.workspace = true
 url.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-percent-encoding.workspace = true
-bytes.workspace = true
+rusqlite.workspace = true
+uuid.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 mdm-test-server = { path = "../mdm-test-server" }
-proptest.workspace = true
 tempfile.workspace = true
-tokio-stream.workspace = true
 tokio = { workspace = true, features = ["full"] }

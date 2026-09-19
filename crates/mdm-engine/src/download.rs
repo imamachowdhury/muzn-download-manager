@@ -1,7 +1,7 @@
 //! The orchestrator: probe, plan, run one worker per segment, publish
 //! progress, steal work from the slowest segment, finish the file.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -24,6 +24,9 @@ use crate::segment::{fetch_segment, SegmentJob, SegmentRuntime};
 pub const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 /// A finished worker steals from a segment only if this much is left.
 pub const STEAL_MIN_REMAINING: u64 = 2 * 1024 * 1024;
+/// How often the part file is fsynced while downloading; see
+/// [`Progress::durable_segments`].
+pub const SYNC_INTERVAL: Duration = Duration::from_secs(1);
 const SPEED_WINDOW: Duration = Duration::from_secs(2);
 
 /// Where a download is.
@@ -54,6 +57,13 @@ pub struct Progress {
     pub eta_secs: Option<u64>,
     /// Every segment, including stolen ones.
     pub segments: Vec<SegmentState>,
+    /// The segments as of the last completed fsync of the part file (taken
+    /// just before it): only these bytes are known to survive a power cut.
+    /// At start it is the starting state (resume segments, or all-zero fresh
+    /// segments). On `Paused` / `Failed` the run syncs once more, so the final
+    /// value equals the outcome's segments. Callers persist this, never
+    /// `segments`, which may count bytes still in the OS cache.
+    pub durable_segments: Vec<SegmentState>,
     /// Current status.
     pub status: Status,
 }
@@ -63,13 +73,15 @@ pub struct Progress {
 pub enum Outcome {
     /// The final path.
     Completed(PathBuf),
-    /// Persist these and pass them back as [`Resume::segments`].
+    /// The durable segments (as of the last successful fsync) — safe to
+    /// persist; pass them back as [`Resume::segments`].
     Paused(Vec<SegmentState>),
     /// A permanent error; the part file is kept for a later resume.
     Failed {
         /// Why.
         error: EngineError,
-        /// State at the time of failure.
+        /// The durable segments (as of the last successful fsync) — safe to
+        /// persist.
         segments: Vec<SegmentState>,
     },
     /// Cancelled; the part file is left for the caller to delete.
@@ -96,12 +108,21 @@ pub struct DownloadSpec {
     pub url: Url,
     /// Directory for the file.
     pub dir: PathBuf,
-    /// Override the probed name.
+    /// Override the probed name. Sanitised like a probed name
+    /// ([`crate::filename::sanitize`]): it can never leave `dir`.
     pub filename: Option<String>,
     /// Headers and cookies.
     pub extras: RequestExtras,
     /// Continue a previous attempt.
     pub resume_from: Option<Resume>,
+    /// Part-file paths the caller owns for downloads that are not running
+    /// (paused, queued); treated exactly like live parts — a fresh start
+    /// picks another name and never deletes them.
+    pub reserved: Vec<PathBuf>,
+    /// Download with one plain GET even if the server advertises ranges
+    /// (a fresh start only; a resume is ranged by definition). For a server
+    /// that passes the range probe and then ignores real ranged requests.
+    pub single_stream: bool,
 }
 
 const STOP_NONE: u8 = 0;
@@ -122,9 +143,38 @@ struct StopOnDrop {
 impl Drop for StopOnDrop {
     fn drop(&mut self) {
         if self.armed {
-            self.stop.store(STOP_PAUSE, Ordering::SeqCst);
+            // Only claim PAUSE if nothing else already set a stop code: a
+            // `cancel()` just before the handle is dropped must still report
+            // Cancelled, not be overwritten into a Paused.
+            let _ = self.stop.compare_exchange(
+                STOP_NONE,
+                STOP_PAUSE,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
             self.cancel.cancel();
         }
+    }
+}
+
+/// Pause or cancel a running download from anywhere, while another task owns
+/// the [`DownloadHandle`] and awaits `wait()`.
+#[derive(Clone, Debug)]
+pub struct DownloadControl {
+    stop: Arc<AtomicU8>,
+    cancel: CancellationToken,
+}
+
+impl DownloadControl {
+    /// Same as [`DownloadHandle::pause`].
+    pub fn pause(&self) {
+        self.stop.store(STOP_PAUSE, Ordering::SeqCst);
+        self.cancel.cancel();
+    }
+    /// Same as [`DownloadHandle::cancel`].
+    pub fn cancel(&self) {
+        self.stop.store(STOP_CANCEL, Ordering::SeqCst);
+        self.cancel.cancel();
     }
 }
 
@@ -137,6 +187,7 @@ impl Drop for StopOnDrop {
 pub struct DownloadHandle {
     probe: Probe,
     part_path: PathBuf,
+    filename: String,
     rx: watch::Receiver<Progress>,
     cancel: CancellationToken,
     stop: Arc<AtomicU8>,
@@ -155,9 +206,23 @@ impl DownloadHandle {
     pub fn part_path(&self) -> &Path {
         &self.part_path
     }
+    /// The name actually used for this download — the probed (or overridden)
+    /// name, or `name (n).ext` when that name was already claimed by another
+    /// live download (`Engine::start`).
+    pub fn filename(&self) -> &str {
+        &self.filename
+    }
     /// Progress stream; the current value is available at once.
     pub fn subscribe(&self) -> watch::Receiver<Progress> {
         self.rx.clone()
+    }
+    /// A cloneable pause / cancel for use while another task owns this
+    /// handle and awaits [`Self::wait`].
+    pub fn control(&self) -> DownloadControl {
+        DownloadControl {
+            stop: self.stop.clone(),
+            cancel: self.cancel.clone(),
+        }
     }
     /// Stop the workers; `wait()` returns `Outcome::Paused`.
     pub fn pause(&self) {
@@ -173,7 +238,7 @@ impl DownloadHandle {
     /// download, like dropping the handle.
     pub async fn wait(mut self) -> Outcome {
         let outcome = (&mut self.join).await.unwrap_or_else(|_| Outcome::Failed {
-            error: EngineError::Network("download task panicked".into()),
+            error: EngineError::Internal("download task panicked".into()),
             segments: Vec::new(),
         });
         self.guard.armed = false;
@@ -189,15 +254,50 @@ impl Engine {
     /// whose part file has the wrong length, is refused with
     /// [`EngineError::InvalidResume`].
     ///
-    /// The caller keeps (dir, filename) unique among live downloads; two live
-    /// downloads of the same name share one part file.
+    /// A second live download of the same name — or one whose part path is in
+    /// [`DownloadSpec::reserved`] — gets `name (1).ext`, and a reserved part
+    /// file is never deleted; a resume
+    /// whose part file is already claimed by another live download is
+    /// refused with [`EngineError::PartInUse`] instead (its name is fixed,
+    /// so there is nowhere else to put it, and the file is not its to delete).
     pub async fn start(&self, spec: DownloadSpec) -> Result<DownloadHandle, EngineError> {
         let probe = self.probe(&spec.url, &spec.extras).await?;
-        let filename = spec
-            .filename
-            .clone()
-            .unwrap_or_else(|| probe.filename.clone());
-        let part_path = spec.dir.join(format!("{filename}{PART_SUFFIX}"));
+        // A caller's name is sanitised like a probed one: `../x`, `/abs/x` or
+        // `C:\x` joined onto `dir` would otherwise write outside it.
+        let base_filename = match spec.filename.as_deref() {
+            Some(name) => crate::filename::sanitize(name),
+            None => probe.filename.clone(),
+        };
+
+        // Claim a live part path exclusively before touching the filesystem:
+        // a fresh start whose chosen name is already live is renamed to
+        // `name (n).ext`; a resume of a live path is refused outright. The
+        // claim is released (`PartClaim::drop`) when the run ends.
+        let (filename, part_path, claim) = {
+            let mut live = self.live_parts.lock().unwrap();
+            let mut filename = base_filename.clone();
+            let mut part_path = spec.dir.join(format!("{filename}{PART_SUFFIX}"));
+            if spec.resume_from.is_some() {
+                // The caller does not reserve its own part file; a reserved
+                // path equal to it is not a conflict.
+                if live.contains(&part_path) {
+                    return Err(EngineError::PartInUse(part_path));
+                }
+            } else {
+                let mut n = 1u32;
+                while live.contains(&part_path) || spec.reserved.contains(&part_path) {
+                    filename = numbered_filename(&base_filename, n);
+                    part_path = spec.dir.join(format!("{filename}{PART_SUFFIX}"));
+                    n += 1;
+                }
+            }
+            live.insert(part_path.clone());
+            let claim = PartClaim {
+                registry: self.live_parts.clone(),
+                path: part_path.clone(),
+            };
+            (filename, part_path, claim)
+        };
 
         let (segments, ranged): (Vec<Arc<SegmentRuntime>>, bool) = match &spec.resume_from {
             Some(r) => {
@@ -228,6 +328,15 @@ impl Engine {
                     true,
                 )
             }
+            // One segment, one plain GET: `ranged = false` also stops `steal()`.
+            None if spec.single_stream => match probe.size {
+                Some(0) => (Vec::new(), false),
+                Some(size) => (
+                    vec![Arc::new(SegmentRuntime::new(0, 0, Some(size - 1), 0))],
+                    false,
+                ),
+                None => (vec![Arc::new(SegmentRuntime::new(0, 0, None, 0))], false),
+            },
             None => match (probe.size, probe.ranges) {
                 (Some(size), true) => (
                     plan_segments(size, self.cfg.max_connections)
@@ -252,17 +361,36 @@ impl Engine {
         if spec.resume_from.is_none() && part_path.exists() {
             std::fs::remove_file(&part_path).map_err(EngineError::from_io)?;
         }
+        // The starting state is durable by definition: a resume's segments
+        // were saved from a durable snapshot, fresh segments claim nothing.
+        let durable: Vec<SegmentState> = {
+            let mut v: Vec<SegmentState> = segments.iter().map(|s| s.snapshot()).collect();
+            v.sort_by_key(|s| s.idx);
+            v
+        };
         let file = Arc::new(PartFile::open(&spec.dir, &filename, probe.size)?);
+        // A redirect that left the caller's origin gets none of its cookies
+        // or Authorization: workers fetch `final_url` directly, so unlike
+        // `probe()` above (which goes through reqwest's own redirect-time
+        // header stripping) nothing else would drop them for a cross-origin
+        // target.
+        let extras = if spec.url.origin() == probe.final_url.origin() {
+            spec.extras.clone()
+        } else {
+            spec.extras.without_credentials()
+        };
         let run = Run {
             engine: self.clone(),
             url: probe.final_url.clone(),
-            extras: spec.extras.clone(),
+            extras,
             file,
             segments: Mutex::new(segments),
+            durable: Mutex::new(durable),
             ranged,
             total: probe.size,
             cancel: CancellationToken::new(),
             stop: Arc::new(AtomicU8::new(STOP_NONE)),
+            _claim: claim,
         };
         let (tx, rx) = watch::channel(run.progress(0, Status::Downloading));
         let cancel = run.cancel.clone();
@@ -276,12 +404,32 @@ impl Engine {
         Ok(DownloadHandle {
             probe,
             part_path,
+            filename,
             rx,
             cancel,
             stop,
             join,
             guard,
         })
+    }
+}
+
+/// `stem (n).ext` for a live-name clash, using the same split rule as
+/// `file::free_name`'s own numbering (`file::split_ext`).
+fn numbered_filename(filename: &str, n: u32) -> String {
+    let (stem, ext) = crate::file::split_ext(filename);
+    format!("{stem} ({n}){ext}")
+}
+
+/// Releases a live part path when the run ends.
+struct PartClaim {
+    registry: Arc<Mutex<HashSet<PathBuf>>>,
+    path: PathBuf,
+}
+
+impl Drop for PartClaim {
+    fn drop(&mut self) {
+        self.registry.lock().unwrap().remove(&self.path);
     }
 }
 
@@ -312,15 +460,23 @@ fn validate_resume(r: &Resume, part_path: &Path) -> Result<(), EngineError> {
             if s.end < s.start {
                 return bad(format!("segment {} ends before it starts", s.idx));
             }
-            if s.downloaded > s.end - s.start + 1 {
+            // `end - start + 1` and `end + 1` can each overflow on corrupted
+            // input (e.g. `end: u64::MAX`); `checked_*` turns that into a
+            // refusal instead of a panic.
+            let len = match s.end.checked_sub(s.start).and_then(|x| x.checked_add(1)) {
+                Some(len) => len,
+                None => return bad(format!("segment {} has an invalid range", s.idx)),
+            };
+            if s.downloaded > len {
                 return bad(format!(
-                    "segment {} claims {} bytes of a {}-byte range",
-                    s.idx,
-                    s.downloaded,
-                    s.end - s.start + 1
+                    "segment {} claims {} bytes of a {len}-byte range",
+                    s.idx, s.downloaded,
                 ));
             }
-            expect = s.end + 1;
+            expect = match s.end.checked_add(1) {
+                Some(e) => e,
+                None => return bad(format!("segment {} end overflows", s.idx)),
+            };
         }
         if expect != r.size {
             return bad(format!(
@@ -345,10 +501,18 @@ struct Run {
     extras: RequestExtras,
     file: Arc<PartFile>,
     segments: Mutex<Vec<Arc<SegmentRuntime>>>,
+    /// The snapshot taken just before the last completed fsync.
+    durable: Mutex<Vec<SegmentState>>,
     ranged: bool,
     total: Option<u64>,
     cancel: CancellationToken,
     stop: Arc<AtomicU8>,
+    // Never given its own accessor: it exists only to release the live-part
+    // claim (`PartClaim::drop`) when `Run` is dropped at the end of `run()`.
+    // `Run` itself must stay free of a `Drop` impl (see `run()`'s partial
+    // move of `self.file`), and a field whose type implements `Drop` does
+    // not force that on the containing struct.
+    _claim: PartClaim,
 }
 
 impl Run {
@@ -392,7 +556,18 @@ impl Run {
             speed_bps,
             eta_secs,
             segments,
+            durable_segments: self.durable.lock().unwrap().clone(),
             status,
+        }
+    }
+
+    /// fsync the part file off the async threads, then record `snap` as durable.
+    async fn sync_to(&self, snap: Vec<SegmentState>) {
+        let file = self.file.clone();
+        match tokio::task::spawn_blocking(move || file.sync()).await {
+            Ok(Ok(())) => *self.durable.lock().unwrap() = snap,
+            Ok(Err(e)) => tracing::warn!(error = %e, "sync of the part file failed"),
+            Err(e) => tracing::warn!(error = %e, "sync task failed"),
         }
     }
 
@@ -431,9 +606,32 @@ impl Run {
         let mut ticker = tokio::time::interval(PROGRESS_INTERVAL);
         let mut meter = SpeedMeter::default();
         let mut failure: Option<EngineError> = None;
+        let mut last_sync = Instant::now();
+        // Set when any worker returns `Ok(())`; only meaningful for the
+        // single-stream-of-unknown-length case below, where it is the only
+        // sign the download is actually complete.
+        let mut worker_ok = false;
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
+                    // Sync BEFORE computing and sending this tick's `Progress`:
+                    // a consumer that persists `durable_segments` only once a
+                    // second of its own (the manager's `PERSIST_INTERVAL`)
+                    // reads whatever this tick carries. Sending the OLD
+                    // (pre-sync) durable snapshot here used to waste that
+                    // consumer's first save on stale (often all-zero) data,
+                    // pushing its next opportunity a full `PERSIST_INTERVAL`
+                    // later — long enough to miss a short download entirely
+                    // (Task 11 review, 2026-09-19). The snapshot is still
+                    // taken BEFORE the fsync: every byte it counts was written
+                    // before it, so the sync covers it. The `Arc<PartFile>`
+                    // clone lives only inside `sync_to`, so `Arc::try_unwrap`
+                    // below still works.
+                    if last_sync.elapsed() >= SYNC_INTERVAL {
+                        let snap = self.snapshot();
+                        self.sync_to(snap).await;
+                        last_sync = Instant::now();
+                    }
                     let p = self.progress(0, Status::Downloading);
                     let speed = meter.push(p.downloaded);
                     tx.send_replace(Progress { speed_bps: speed, ..p });
@@ -441,6 +639,7 @@ impl Run {
                 res = set.join_next() => match res {
                     None => break,
                     Some(Ok(Ok(()))) => {
+                        worker_ok = true;
                         if failure.is_none() && !self.cancel.is_cancelled() {
                             if let Some(job) = self.steal() {
                                 set.spawn(fetch_segment(job));
@@ -456,12 +655,27 @@ impl Run {
                     }
                     Some(Err(_)) => {
                         if failure.is_none() {
-                            failure = Some(EngineError::Network("worker panicked".into()));
+                            failure = Some(EngineError::Internal("worker panicked".into()));
                             self.cancel.cancel();
                         }
                     }
                 }
             }
+        }
+
+        // Every worker has ended, so the segments no longer move. A run that
+        // is not heading for completion syncs once more, so a Paused / Failed
+        // outcome is durable; this happens while `self` is still whole.
+        let stop = self.stop.load(Ordering::SeqCst);
+        // A single stream of unknown length has no `end` to reach: its
+        // worker returning Ok means the server ended the body normally.
+        let all_done = if !self.ranged && self.total.is_none() {
+            failure.is_none() && worker_ok
+        } else {
+            self.snapshot().iter().all(|s| s.is_done())
+        };
+        if failure.is_some() || stop != STOP_NONE || !all_done {
+            self.sync_to(self.snapshot()).await;
         }
 
         // Everything the final `Progress` needs is read from `self` HERE, while
@@ -471,36 +685,40 @@ impl Run {
         let segments = self.snapshot();
         let downloaded: u64 = segments.iter().map(|s| s.downloaded).sum();
         let total = self.total;
-        let stop = self.stop.load(Ordering::SeqCst);
-        let all_done = segments.iter().all(|s| s.is_done());
+        let durable = self.durable.lock().unwrap().clone();
         let file = self.file;
 
+        // Every outcome but Completed carries the DURABLE snapshot: the caller
+        // persists it, and after a failed final sync or `finish()` the live
+        // segments would claim bytes that never reached the disk. After a
+        // successful final sync the two are equal.
         let outcome = if let Some(error) = failure {
             Outcome::Failed {
                 error,
-                segments: segments.clone(),
+                segments: durable.clone(),
             }
+        } else if stop == STOP_CANCEL {
+            Outcome::Cancelled
+        } else if all_done {
+            match Arc::try_unwrap(file) {
+                Ok(file) => match file.finish() {
+                    Ok(path) => Outcome::Completed(path),
+                    Err(error) => Outcome::Failed {
+                        error,
+                        segments: durable.clone(),
+                    },
+                },
+                Err(_) => Outcome::Failed {
+                    error: EngineError::Internal("part file still in use".into()),
+                    segments: durable.clone(),
+                },
+            }
+        } else if stop == STOP_PAUSE {
+            Outcome::Paused(durable.clone())
         } else {
-            match stop {
-                STOP_PAUSE => Outcome::Paused(segments.clone()),
-                STOP_CANCEL => Outcome::Cancelled,
-                _ if all_done => match Arc::try_unwrap(file) {
-                    Ok(file) => match file.finish() {
-                        Ok(path) => Outcome::Completed(path),
-                        Err(error) => Outcome::Failed {
-                            error,
-                            segments: segments.clone(),
-                        },
-                    },
-                    Err(_) => Outcome::Failed {
-                        error: EngineError::Network("part file still in use".into()),
-                        segments: segments.clone(),
-                    },
-                },
-                _ => Outcome::Failed {
-                    error: EngineError::Network("workers ended with bytes missing".into()),
-                    segments: segments.clone(),
-                },
+            Outcome::Failed {
+                error: EngineError::Internal("workers ended with bytes missing".into()),
+                segments: durable.clone(),
             }
         };
         let status = match &outcome {
@@ -508,6 +726,11 @@ impl Run {
             Outcome::Paused(_) => Status::Paused,
             Outcome::Failed { .. } => Status::Failed,
             Outcome::Cancelled => Status::Cancelled,
+        };
+        // `finish()` fsyncs before the rename: a completed file is durable whole.
+        let durable_segments = match &outcome {
+            Outcome::Completed(_) => segments.clone(),
+            _ => durable,
         };
         tx.send_replace(Progress {
             total,
@@ -520,6 +743,7 @@ impl Run {
                 _ => None,
             },
             segments,
+            durable_segments,
             status,
         });
         outcome

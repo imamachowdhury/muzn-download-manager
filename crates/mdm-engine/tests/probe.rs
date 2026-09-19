@@ -1,10 +1,8 @@
-mod support;
-
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use mdm_engine::{Engine, EngineConfig, EngineError, RequestExtras};
-use support::*;
+use mdm_test_server::*;
 use url::Url;
 
 fn engine() -> Engine {
@@ -142,6 +140,22 @@ async fn probe_does_not_hang_on_a_silent_server() {
     .await
     .expect("the probe must give up within 3 s");
     assert_eq!(r.unwrap_err().code(), "NETWORK");
+}
+
+#[tokio::test]
+async fn ranges_that_are_not_advertised_are_still_found() {
+    let s = TestServer::start(50_000).await;
+    s.cfg.advertise_ranges.store(false, Ordering::SeqCst);
+    let p = engine()
+        .probe(
+            &Url::parse(&s.file_url()).unwrap(),
+            &RequestExtras::default(),
+        )
+        .await
+        .unwrap();
+    assert!(p.ranges, "a 206 to bytes=0-0 proves range support");
+    assert_eq!(p.size, Some(50_000));
+    assert_eq!(s.cfg.requests.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

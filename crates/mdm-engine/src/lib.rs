@@ -19,8 +19,8 @@ pub mod probe;
 pub mod request;
 pub mod segment;
 pub use download::{
-    DownloadHandle, DownloadSpec, Outcome, Progress, Resume, Status, PROGRESS_INTERVAL,
-    STEAL_MIN_REMAINING,
+    DownloadControl, DownloadHandle, DownloadSpec, Outcome, Progress, Resume, Status,
+    PROGRESS_INTERVAL, STEAL_MIN_REMAINING, SYNC_INTERVAL,
 };
 pub use engine::{Engine, EngineConfig, Proxy};
 pub use error::EngineError;
