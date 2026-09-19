@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { removeWithConfirm, toggle } from "./lib/actions";
 import { shortcutFor, step } from "./lib/keys";
+import { AddDialog } from "./components/AddDialog";
 import { DownloadList } from "./components/DownloadList";
 import { FilterRail } from "./components/FilterRail";
 import { TopBar } from "./components/TopBar";
@@ -57,8 +58,8 @@ export function App() {
           <DownloadList />
         </div>
       </div>
-      {/* Task 7 renders the add dialog while `adding`; Task 9 the settings while `settingsOpen`. */}
-      {adding && null}
+      {/* Task 9 renders the settings dialog while `settingsOpen`. */}
+      {adding && <AddDialog onClose={() => setAdding(false)} />}
       {settingsOpen && null}
       <ConfirmHost />
       <ToastHost />
